@@ -109,6 +109,15 @@ inline bool force_pageable() {
     return v;
 }
 constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_slots(), at most ring_cap()
+// STRATA_GROUP_ASYNC (A/B, off by default): a MoE layer's host grouping waits only for its routed ids to land, not for
+// the whole compute queue, and the shared expert's projections are enqueued after that copy, so they run while the
+// host sorts.  1: the host polls a sequence number the compute queue writes after the ids copy (the Stager::issued_one
+// pattern, the one the Level Zero v2 adapter survives); 2: a host wait on the copy's event (the plain form; such a
+// wait hung the stager under that adapter, see issued_one).  Anything else, or unset: the queue is drained as before.
+inline int group_async_mode() {
+    static const int v = [] { const char* e = std::getenv("STRATA_GROUP_ASYNC"); return e ? (e[0] == '2' ? 2 : e[0] == '1' ? 1 : 0) : 0; }();
+    return v;
+}
 // The chunk size from which every expert streams: 1024 since 0.1.30 (was 2048).  Measured on the 5070, Q2_0 / IQ2_XS,
 // fixed cache: 1,500-token prompts 621 -> 785 / 612 -> 735 tok/s, 2,000 727 -> 934 / 712 -> 892, 4,000 (its last
 // chunk) 779 -> 912 / 766 -> 844, the same output.  Below ~1,000 tokens the output changed on Q2_0 (a smaller chunk
@@ -698,6 +707,10 @@ struct Prefill::Impl {
     uint64_t* ple_done_seq = nullptr;
     uint64_t ple_want[2] = {};
     uint64_t ple_seq = 0;
+    // STRATA_GROUP_ASYNC=1: the sequence number the compute queue writes after each layer's routed-ids copy (page-locked,
+    // polled by the host like ple_done_seq)
+    uint64_t* grp_done_seq = nullptr;
+    uint64_t grp_seq = 0;
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -783,6 +796,7 @@ void Prefill::release() {
             sycl::free(impl_->hand[b], dpct::get_in_order_queue());
         if (impl_->ple_copied[b]) dpct::destroy_event(impl_->ple_copied[b]);
         if (b == 1 && impl_->ple_done_seq) { sycl::free(impl_->ple_done_seq, dpct::get_in_order_queue()); impl_->ple_done_seq = nullptr; }
+        if (b == 1 && impl_->grp_done_seq) { sycl::free(impl_->grp_done_seq, dpct::get_in_order_queue()); impl_->grp_done_seq = nullptr; }
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty())
             sycl::free(impl_->ple_emb_host[b], dpct::get_in_order_queue());
     }
@@ -1056,6 +1070,10 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
             m.ple_done_seq = sycl::malloc_host<uint64_t>(2, dpct::get_in_order_queue());
             if (m.ple_done_seq) m.ple_done_seq[0] = m.ple_done_seq[1] = 0;
             else ok = false;
+        }
+        if (b == 1 && !m.grp_done_seq && group_async_mode() == 1) {   // without it the layer falls back to the drain
+            m.grp_done_seq = sycl::malloc_host<uint64_t>(1, dpct::get_in_order_queue());
+            if (m.grp_done_seq) m.grp_done_seq[0] = 0;
         }
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
@@ -1976,10 +1994,17 @@ struct PfTimer {
         dpct::sync_barrier(ev[used], s);
         ++used;
     }
-    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
+    // the recorded marks that have completed (all of them after a stream synchronize; with STRATA_GROUP_ASYNC the
+    // host waited only for the routed ids and the shared expert's marks may still be running: those stay for the
+    // next fold, their timings are not read): charge the gaps, keep the last completed mark as the next gap's start
     void fold() try {
         if (!on || used < 2) return;
-        for (size_t i = 0; i + 1 < used; ++i) {
+        size_t done = 0;   // marks [0, done) have completed
+        while (done < used && ev[done]->get_info<sycl::info::event::command_execution_status>() ==
+                                  sycl::info::event_command_status::complete)
+            ++done;
+        if (done < 2) return;
+        for (size_t i = 0; i + 1 < done; ++i) {
             float t = 0.0f;
             if (DPCT_CHECK_ERROR(
                     t = (ev[i + 1]
@@ -1990,9 +2015,10 @@ struct PfTimer {
                                                       command_start>()) /
                         1000000.0f) == 0) ms[ph[i]] += t;
         }
-        std::swap(ev[0], ev[used - 1]);
-        std::swap(ph[0], ph[used - 1]);
-        used = 1;
+        // keep [done - 1, used) in order at the front; the folded events are reused behind them
+        std::rotate(ev.begin(), ev.begin() + (std::ptrdiff_t) (done - 1), ev.begin() + (std::ptrdiff_t) used);
+        std::rotate(ph.begin(), ph.begin() + (std::ptrdiff_t) (done - 1), ph.begin() + (std::ptrdiff_t) used);
+        used -= done - 1;
     }
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -3175,14 +3201,6 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
-                    // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
-                    if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                    if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3200,6 +3218,49 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    // STRATA_GROUP_ASYNC (group_async_mode): the host grouping below needs only the routed ids, so their
+                    // copy goes out right after `route`, ahead of the shared expert, and the host later waits for that
+                    // copy alone (not for the queue), while the shared expert's four projections and its gate run on the
+                    // GPU.  Only where the layer groups on the host (the fused path groups on the GPU, no sync at all) and
+                    // without a peer GPU (the peer path folds its timeline at the drain).  Default: the ids copy is issued
+                    // after the shared expert and the queue is drained, as before.
+                    const bool grp_mapped = m.grp_host != nullptr;
+                    const int group_async = !fused_l && !m.pp && (group_async_mode() == 2 || (group_async_mode() == 1 && m.grp_done_seq))
+                                                ? group_async_mode() : 0;
+                    sycl::event ids_ev;
+                    uint64_t ids_want = 0;
+                    // the routed ids, device to host: into the mapped table (a kernel), or a copy (STRATA_GROUP_COPY=1).
+                    // With `want_event`, returns the event that completes when the ids are on the host (in order: `route`
+                    // is done by then too); the kernel form needs a barrier for it, so it is only asked for in mode 2.
+                    auto copy_ids_down = [&](bool want_event) -> sycl::event {
+                        if (grp_mapped) {
+                            copy_i32(m.grp_dev, m.ids, T * K, m.cs);
+                            return want_event ? m.cs->ext_oneapi_submit_barrier() : sycl::event();
+                        }
+                        /*
+                        DPCT1124: cudaMemcpyAsync is migrated to
+                        asynchronous memcpy API. While the origin API might be
+                        synchronous, it depends on the type of operand memory,
+                        so you may need to call wait() on event return by memcpy
+                        API to ensure synchronization behavior.
+                        */
+                        return m.cs->memcpy(m.ids_host.data(), m.ids, (size_t) T * K * 4);
+                    };
+                    if (group_async) {
+                        ids_ev = copy_ids_down(group_async == 2);
+                        if (group_async == 1) {   // the queue stamps the sequence once the copy is done; the host polls it
+                            ids_want = ++m.grp_seq;
+                            m.cs->fill<uint64_t>(m.grp_done_seq, ids_want, 1);
+                        }
+                    }
+                    // the shared expert and its scalar gate
+                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                    m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                    if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3277,30 +3338,40 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         }
                     } else {
                         // group the (token, k) pairs by expert on the host
+                        // (STRATA_GROUP_ASYNC: this mark comes after the shared expert's launches, so the GPU's idle
+                        // time from its last projection to the slot/src uploads lands on "host grouping" - the bubble
+                        // the switch is meant to shrink; "router+shared" keeps its meaning)
                         pt.mark(kPfHostGroup, cs);
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
-                        const bool grp_mapped = m.grp_host != nullptr;
                         int32_t* ids_h = grp_mapped ? m.grp_host : m.ids_host.data();
                         int32_t* slot_h = grp_mapped ? m.grp_host + m.grp_tk : m.slot_host.data();
                         int32_t* src_h = grp_mapped ? m.grp_host + 2 * m.grp_tk : m.src_host.data();
-                        if (grp_mapped) copy_i32(m.grp_dev, m.ids, T * K, m.cs);
-                        /*
-                        DPCT1124: cudaMemcpyAsync is migrated to
-                        asynchronous memcpy API. While the origin API might be
-                        synchronous, it depends on the type of operand memory,
-                        so you may need to call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        else m.cs->memcpy(m.ids_host.data(), m.ids,
-                                          (size_t)T * K * 4);
+                        if (!group_async) copy_ids_down(false);   // async: issued before the shared expert
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
-                        m.cs->wait();
+                        if (group_async) {
+                            // Only the ids copy is waited for.  The queue is in order, so its completion also covers
+                            // `route` (which wrote m.ids) and the previous layer's copy_i32 kernels that read the mapped
+                            // slot/src/bounds tables the host writes below (they were enqueued before this copy).  The
+                            // shared expert may still be running: the host reads nothing it writes (sgate, sup, sh_h,
+                            // shared, sg are read by combine, on the GPU), and everything enqueued below (the slot/src
+                            // uploads, gather/quantize, the experts) follows it on the same queue.  With STRATA_GROUP_COPY
+                            // unset the host reads the mapped ids directly: the completed copy is what makes them whole;
+                            // the acquire fence keeps the compiler and the CPU from moving those reads above the poll.
+                            if (group_async == 1) {
+                                while (*(volatile const uint64_t*) m.grp_done_seq < ids_want) std::this_thread::yield();
+                            } else {
+                                ids_ev.wait();
+                            }
+                            std::atomic_thread_fence(std::memory_order_acquire);
+                        } else {
+                            m.cs->wait();
+                        }
                         core::progress_at("reading the prompt (batched): layer", l, p0);
-                        pt.fold();
+                        pt.fold();   // async: only the marks that have completed; the shared expert's wait for the next fold
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             /*
                             DPCT1093: The "pe.dev" device may be not the one

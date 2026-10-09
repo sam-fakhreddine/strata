@@ -632,6 +632,13 @@ kernels (greedy sampler, QSA top-k) would save next to nothing here: the sampler
 token. Q4_0 tensor-core prompt attention (#452) is not worth porting: the port's XMX prompt attention is 2-3x slower
 than the plain kernel it uses for every KV format.
 
+That "host grouping" share is mostly a bubble: per MoE layer the host sorts the routed ids after the queue is drained
+(`m.cs->wait()`), and the GPU idles until the slot/src tables come back. `STRATA_GROUP_ASYNC=1` (A/B, off by default)
+issues the ids copy right after the router, enqueues the shared expert's projections after it, and waits only for the
+ids copy (a sequence number the queue writes, polled like the stager's), so the shared expert runs while the host sorts;
+`=2` waits on the copy's event instead (the form that hung the stager under the Level Zero v2 adapter, kept for the
+comparison). `STRATA_GROUP_COPY=1` still chooses copies over the mapped tables, on either path.
+
 **The 0.1.38 merge (2026-10-03).** Upstream 0.1.35 -> 0.1.38 (83 commits) merged the seven PRs the port had taken
 early, so their header forks in `sycl/include` are gone; the merge base for the 3-way merge was the port's own "main +
 PRs" migration. New in the port with it: the DeltaNet output norm without its dead FP32 store, two prompt-path
