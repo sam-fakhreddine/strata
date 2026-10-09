@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/gr_fuse_read.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -202,6 +203,39 @@ gr_mix_r_kernel(const float *__restrict__ R, const float *__restrict__ rs,
         const int64_t j = t * D + c * N + d;
         const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
         s = sycl::fma((float)x, sigm(g[j]), s);
+    }
+    s /= (float) HC;
+    mixed[i] = s;
+    if (mixed16) {
+        const uint16_t h = act16(s);
+        mixed16[i] = h;
+        if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+    }
+    if (mixed_h) mixed_h[i] = hf(s);
+}
+// STRATA_GR_FUSE_READ=1 (this port): gr_mix_r_kernel's mix over the BF16 image gr_norm_rs_kernel (or the fused
+// write-norm) already wrote for the GEMMs, instead of recomputing x = R * rs * w from the FP32 residual.  The second
+// full pass over R (T x 10240 floats) becomes a pass over T x 10240 BF16: half the bytes.  Not bit-identical to
+// gr_mix_r_kernel: x carries BF16's 8 mantissa bits here (what the down and inject projections see of it), the
+// summation (fma over c in order, / 4) and the output images are gr_mix_r_kernel's.  `ldx` is xn16's token stride.
+__dpct_inline__ void
+gr_mix_x16_kernel(const uint16_t *__restrict__ xn16, int64_t ldx,
+                  const float *__restrict__ g, float *__restrict__ mixed,
+                  uint16_t *__restrict__ mixed16, int64_t T,
+                  uint16_t *__restrict__ mixed_h,
+                  uint16_t *__restrict__ mixed16_lo) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const int64_t j = t * D + c * N + d;
+        const float x = sycl::bit_cast<float>((uint32_t) xn16[t * ldx + c * N + d] << 16);   // bf16(R * rs * w)
+        s = sycl::fma(x, sigm(g[j]), s);
     }
     s /= (float) HC;
     mixed[i] = s;
@@ -2299,6 +2333,28 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
                 });
     }
     check("gr_mix_r");
+}
+void gr_mix_x16(const uint16_t* xn16, int64_t ldx, const float* gated, float* mixed, uint16_t* mixed16, int64_t T,
+                void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->submit([&](sycl::handler &cgh) {
+                auto ldx_ldx_D_ct1 = ldx > 0 ? ldx : D;
+
+                cgh.parallel_for<dpct_kernel_name<class gr_mix_x16_kernel_7f2a91>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, blocks_for(T * N)) *
+                                          sycl::range(1, 1, 256),
+                                      sycl::range(1, 1, 256)),
+                    exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        gr_mix_x16_kernel(xn16, ldx_ldx_D_ct1, gated, mixed, mixed16, T,
+                                          mixed_h, mixed16_lo);
+                    });
+            });
+    }
+    check("gr_mix_x16");
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
