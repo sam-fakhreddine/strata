@@ -2,7 +2,9 @@
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

@@ -8,7 +8,9 @@
 //
 // Naive on purpose: one thread per block, no vectors, no shared memory, no unrolling.  Phase 3 changes this
 // file and the parity test in src/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/dequant_s2.hpp"

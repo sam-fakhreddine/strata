@@ -1,6 +1,8 @@
 // Capacity 262144, live prefill up to the register boundary, and the legacy fallbacks.
 // Compare selected IDs only: unused output padding is not part of the API contract.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/qsa.hpp"

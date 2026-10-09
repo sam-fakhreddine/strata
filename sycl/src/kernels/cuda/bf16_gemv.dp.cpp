@@ -1,5 +1,7 @@
 // src/kernels/cuda/bf16_gemv.cu - the BF16 GEMV.  See the header for why it is not `s_gemv`.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

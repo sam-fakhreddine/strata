@@ -26,7 +26,9 @@
 // Both changes alter the summation order or the expression, so this kernel is checked against the naive
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/s_gemv.hpp"

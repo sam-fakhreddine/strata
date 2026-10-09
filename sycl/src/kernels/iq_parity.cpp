@@ -12,7 +12,9 @@
 // MMVQ dot (q8_1 activations) must match the float matrix-vector product over that reference within the
 // activation rounding (a few 1e-3 relative), for 1 to 8 columns, every column of a multi-column call bitwise
 // equal to a one-column call on it.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/iq_kernels.hpp"

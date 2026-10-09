@@ -9,7 +9,9 @@
 //      fixed without being fixed.
 //   3. The measured size of that difference is reported, so the number in the state file is one this test
 //      produces rather than one quoted from elsewhere.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/quantize_act.hpp"

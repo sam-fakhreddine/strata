@@ -6,7 +6,9 @@
 // 3. kv_append_q4_step and kv_gather_q4_step through paged pool against host reference.
 // 4. Invariance of dot products under Walsh-Hadamard rotation: (H*q) . (H*k) == q . k.
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/f16_bits.hpp"

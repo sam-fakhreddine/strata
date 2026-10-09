@@ -17,9 +17,12 @@
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -476,8 +479,8 @@ float time_ms(dpct::queue_ptr s, int it, const auto &fn) {
     ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "bench");
     float ms = 0;
     ms =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
+        (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+         strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
         1000000.0f;
     dpct::destroy_event(e0);
     dpct::destroy_event(e1);

@@ -11,7 +11,9 @@
 //     d16 = fp16(d32)                           (stored, and used to DEQUANTIZE)
 //     q   = clip(rint(x / (double)d32), -128, 127)
 //     round trip = q * d16
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/quantize_act.hpp"

@@ -14,7 +14,9 @@
 // enters once, here, at build time (`rope_scaling.hpp`).
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdint>

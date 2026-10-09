@@ -8,9 +8,12 @@
 // So this builds a fixture where that happens, computes the greedy pick under BOTH orders, and requires them to
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -506,10 +509,8 @@ void bench_sampled() {
             check(DPCT_CHECK_ERROR(e1->wait_and_throw()), "bench sync");
             float ms = 0.0f;
             check(DPCT_CHECK_ERROR(
-                      ms = (e1->get_profiling_info<
-                                sycl::info::event_profiling::command_end>() -
-                            e0->get_profiling_info<
-                                sycl::info::event_profiling::command_start>()) /
+                      ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                            strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                            1000000.0f),
                   "elapsed");
             std::printf("  bench: n_vocab %d, rows %d, top_k %2d, top_p 0.95: %8.1f us per call\n", NV, T, k,

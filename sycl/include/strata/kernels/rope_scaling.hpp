@@ -35,7 +35,9 @@
 // the cache is stored POST-RoPE, so a mid-run change would mix two scalings in one cache.
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cmath>

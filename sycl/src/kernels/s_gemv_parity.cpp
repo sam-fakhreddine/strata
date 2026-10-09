@@ -17,7 +17,9 @@
 // ones `bench/micro/dequant_xcheck` checks against **ggml's own** dequantizers.  Reconstructing raw from
 // canonical is the inverse of what the packer does, and it is written here independently of the packer so the
 // two are not the same code.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/dequant.hpp"

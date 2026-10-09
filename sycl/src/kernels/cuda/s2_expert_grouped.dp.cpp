@@ -13,7 +13,9 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_math.hpp"

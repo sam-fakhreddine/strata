@@ -4,7 +4,9 @@
 // accepted exactly when greedy decode would have produced them), so every kernel here is checked against the
 // one it stands in for, on random inputs that include -0.0, denormals, NaN, -inf and large values.  The tests
 // follow eddoursul's fork (MIT; verify_parity.cpp), ported to this tree's kernels.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/sampler.hpp"

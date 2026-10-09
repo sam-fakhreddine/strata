@@ -1,5 +1,7 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

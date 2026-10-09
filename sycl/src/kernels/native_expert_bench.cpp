@@ -6,7 +6,9 @@
 // Modes are STRATA_EXP_MODE values.  A group is one expert (distinct blobs, ~2 MB each, so G >= 8 does not fit
 // in L2); its entries read distinct tokens of an 8-token window.  The output must be bitwise equal to the
 // reference mode's: the verify window's text depends on it.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/gguf_reader.hpp"

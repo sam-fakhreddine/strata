@@ -1,5 +1,7 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

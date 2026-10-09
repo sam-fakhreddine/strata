@@ -4,9 +4,12 @@
 // Usage: qsa_select_bench [context=131072] [queries=256] [reps=10] [capacity_cells]
 // capacity_cells (the engine's --max-context): the score buffers and the top-k dispatch follow the CAPACITY
 // (max_blocks = capacity / 4 + 2), the work follows the context. Default: capacity = context (max_blocks = ctx / 4 + 1).
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 
@@ -205,10 +208,8 @@ int main(int argc, char** argv) {
         dpct::sync_barrier(e1);
         ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
         float ms = 0;
-        ms = (e1->get_profiling_info<
-                  sycl::info::event_profiling::command_end>() -
-              e0->get_profiling_info<
-                  sycl::info::event_profiling::command_start>()) /
+        ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+              strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
              1000000.0f;
         return ms / reps;
     }

@@ -2,9 +2,12 @@
 // ones, bit for bit on every output (lo, rs, inject, mixed, the in-place R), and each one's time.
 //
 //     build/fused_gr_bench [iters] [T min] [T max]
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
 #include <cmath>
@@ -176,11 +179,8 @@ int main(int argc, char** argv) {
                         dpct::sync_barrier(e1, s);
                         e1->wait_and_throw();
                         float ms = 0;
-                        ms = (e1->get_profiling_info<
-                                  sycl::info::event_profiling::command_end>() -
-                              e0->get_profiling_info<
-                                  sycl::info::event_profiling::
-                                      command_start>()) /
+                        ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                              strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                              1000000.0f;
                         us[f] = std::fmin(us[f], 1e3 * ms / iters);
                     }

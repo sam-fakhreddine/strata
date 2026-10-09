@@ -25,7 +25,9 @@
 // `freq_scale`; YaRN blends extrapolation and interpolation along the pairs (ggml's `rope_yarn`) and folds
 // the mscale magnitude correction into the same cos/sin values.  All of it float64, in the reference's
 // order, so `rope_parity` can hold every variant to a bit-exact float64 transcription of the same spec.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

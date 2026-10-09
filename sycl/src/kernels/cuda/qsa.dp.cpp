@@ -40,7 +40,9 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
