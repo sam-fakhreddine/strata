@@ -5,7 +5,9 @@
 //
 // For each type: the first 4 rows of the first tensor of that type, FP32 path compared with a relative tolerance of
 // 1e-6 (the products are the reference's, reordered at most), BF16 path within half a BF16 ulp of the CPU value.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/dequant.hpp"

@@ -6,12 +6,40 @@
 #pragma once
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 namespace strata {
 inline sycl::queue* q_of(const void* stream) {
     return stream ? (sycl::queue*) stream : &dpct::get_in_order_queue();
 }
+
+// Event timestamps (cudaEventElapsedTime in the CUDA source) need queues created with enable_profiling. dpct does that
+// when DPCT_PROFILING_ENABLED is defined, which every migrated file does at its top, guarded on the CMake option
+// STRATA_SYCL_PROFILING_QUEUES (default ON). What the macro changes in dpct: create_queue_impl adds
+// sycl::property::queue::enable_profiling() to every queue (include/dpct/device.hpp), and dpct::sync_barrier records an
+// event as `queue->ext_oneapi_submit_barrier()` instead of an empty `queue->single_task([=]() {})`. Nothing else in the
+// dpct tree the port uses reads the macro (codepin does, and is not included). Without the property
+// sycl::event::get_profiling_info throws errc::invalid, so every timing site reads its timestamps through prof_ns():
+// 0 ns when profiling is off, so each elapsed time comes out as 0 ms, and one note on stderr says why.
+inline void prof_off_note() {
+    static const bool once = [] {
+        std::fprintf(stderr, "strata: GPU event timings read 0 (profiling off: built with -DSTRATA_SYCL_PROFILING_QUEUES=OFF)\n");
+        return true;
+    }();
+    (void) once;
+}
+template <typename Param> inline uint64_t prof_ns(const sycl::event& e) {
+#ifdef DPCT_PROFILING_ENABLED
+    return e.get_profiling_info<Param>();
+#else
+    (void) e;
+    prof_off_note();
+    return 0;
+#endif
+}
+template <typename Param> inline uint64_t prof_ns(const sycl::event* e) { return prof_ns<Param>(*e); }
 }  // namespace strata
 
 namespace strata {

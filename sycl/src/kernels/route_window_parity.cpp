@@ -4,7 +4,9 @@
 // n-token top-k.  Speculative decoding is exact only if a token's route does not depend on how many tokens share
 // its window, so both batched kernels must equal their one-token forms exactly - this checks that on random data
 // shaped like the router (2560 -> 256, top-10) and like the shared-expert gate (2560 -> 1).
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/bf16_gemv.hpp"

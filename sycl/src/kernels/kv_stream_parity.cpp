@@ -10,7 +10,9 @@
 //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
 // INT8, FP16, Q4_0 (PR #21) and hybrid K8V4 pools; K8V4's appends are the engine's folded calls (layer.cpp), its host
 // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/kv_q4.hpp"

@@ -8,7 +8,9 @@
 //   3. the composed gathers bitwise vs the host dequantization of those codes;
 //   4. qsa_decode_attn<3> + output fwht vs a host attention over the SAME dequantized K/V (fp32 math), and
 //      bounded against the fp32-true attention from the unquantized K/V.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/f16_bits.hpp"

@@ -24,7 +24,9 @@
 // Check 5 holds the TWO PATHS together: the table path's float64 host trig and the native path's float32
 // fast-math device trig must answer to the same `RopeScaling`, yarn and none alike, so one cache never
 // mixes two rotations.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/rope.hpp"

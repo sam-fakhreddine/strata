@@ -4,7 +4,9 @@
 // Cells land at scattered positions through a non-identity page table; the K/V rows are random with small, large and
 // all-zero groups. Three layouts: INT8 K and V, Q4_0 K and V, and the K8V4 hybrid's folded call (the K pool passed as
 // both halves, one plane). GPU, synthetic, no model.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/kv_q4.hpp"

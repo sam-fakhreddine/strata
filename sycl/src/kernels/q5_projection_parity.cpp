@@ -1,6 +1,8 @@
 // Q5_1 shared-expert projection: Strata CUDA dequantization vs ggml.
 #define NOMINMAX
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/gguf_reader.hpp"

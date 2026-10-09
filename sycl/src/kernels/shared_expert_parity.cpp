@@ -14,7 +14,9 @@
 //   2. THE SCALAR GATE.  `ffn_gate_inp_shexp` is (n_embd,) and yields ONE value per token; the two rival
 //      readings are a per-dimension elementwise gate and a per-expert gate.  The elementwise reading is
 //      checked the same way - it is computed and required to differ.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/bf16_bits.hpp"

@@ -6,7 +6,9 @@
 // decodes to the same values on every block of the artifact.  So this compares "GPU canonical decode" against
 // "CPU decode already proven equal to ggml", and a fault in either the canonicaliser or the kernel shows up
 // here.  A parity test whose two sides were written together would show neither.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/dequant.hpp"

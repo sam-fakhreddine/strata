@@ -10,7 +10,9 @@
 //      `ple_layer_xcheck.cpp`.  That file records EVERY intermediate (key, value, gate, gated, normalized,
 //      conv_out, result), so a mismatch can be attributed to a stage instead of guessed at - and the weights
 //      in it were checked to be the artifact's real ones before this test was written.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/ple.hpp"

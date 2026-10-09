@@ -14,7 +14,9 @@
 // Every other build (HIP, CUDA before 13) and every single copy or group over 128 takes the loop.  A batch the
 // runtime refuses is redone as the loop (with one warning), never dropped: readiness is signalled only for
 // uploads that were submitted.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 

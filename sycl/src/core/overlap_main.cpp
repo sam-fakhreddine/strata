@@ -9,7 +9,9 @@
 //
 // Measured against a SERIAL baseline in the same process, because the interesting quantity is the ratio and
 // not the absolute figure - and L6 established that absolute figures on this machine move by 20%.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/pinned.hpp"

@@ -16,7 +16,9 @@
 // Layout: activations are (n_in/32) ggml Q8_0 blocks, 34 bytes each - `fp16 d` then `int8 qs[32]` - produced by
 // `strata::kernels::quantize_q8_0`.  A quad of four elements lies inside one 32-element block, so the block
 // scale is constant across it and is loaded once.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

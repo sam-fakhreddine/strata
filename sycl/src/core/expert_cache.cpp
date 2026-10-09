@@ -1,7 +1,9 @@
 #define DPCT_COMPAT_RT_VERSION 12080
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the
 // header first.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

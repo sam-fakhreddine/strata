@@ -15,7 +15,9 @@
 // holds into the peer's least-used slots (per layer, so a slot keeps its layer's blob size).
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/expert_cache.hpp"

@@ -46,9 +46,12 @@
 //   * the attention against a reference reading the f32 keys: REPORTED and then checked against the phase's
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 
@@ -1298,10 +1301,8 @@ int main(int argc, char** argv) {
             dpct::sync_barrier(b);
             b->wait_and_throw();
             float ms = 0;
-            ms = (b->get_profiling_info<
-                      sycl::info::event_profiling::command_end>() -
-                  a->get_profiling_info<
-                      sycl::info::event_profiling::command_start>()) /
+            ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(b) -
+                  strata::prof_ns<sycl::info::event_profiling::command_start>(a)) /
                  1000000.0f;
             std::printf("  %-48s %8.1f us\n", name.c_str(), ms * 1000.0f / (float) reps);
             dpct::destroy_event(a);

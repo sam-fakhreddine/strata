@@ -9,7 +9,9 @@
 // FMA, which changes the result in the last bits, and nvcc does.  So this asserts a RELATIVE error, measures
 // what it actually is, and prints the number - the phase spec allows 1e-3 for FP16 paths, and if the measured
 // error were near that the tolerance would be hiding something rather than bounding rounding.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/artifact/dequant.hpp"

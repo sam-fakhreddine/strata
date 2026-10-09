@@ -10,7 +10,9 @@
 //      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
 //      activation is the rival reading, computed and required to differ, because it is what the engine did
 //      before `docs/activation-contract.md` settled the question and it produces perfectly plausible output.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/bf16_bits.hpp"

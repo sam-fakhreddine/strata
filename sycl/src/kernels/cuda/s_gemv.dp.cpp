@@ -4,7 +4,9 @@
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

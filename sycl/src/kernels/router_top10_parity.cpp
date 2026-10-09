@@ -9,7 +9,9 @@
 // logit distributions including ties (where the "smallest index wins" rule is the only thing that decides) and
 // near-ties (where a float difference decides).  It also asserts that the 2**-14 CLAMP CANNOT TRIGGER for this
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/router_top10.hpp"

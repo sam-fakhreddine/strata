@@ -9,7 +9,9 @@
 // then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
 // sets *plan_err).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/verify_kernels.hpp"

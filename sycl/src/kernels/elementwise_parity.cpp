@@ -12,7 +12,9 @@
 //      instead of decaying, so the sign is checked as a property and not assumed.
 //   3. `silu` IS COMPUTED IN DOUBLE then cast, because `ref/gdn.py`'s numpy does.  f32 `expf` differs in the
 //      last bits, and the test measures that rather than asserting it away.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/dequant_bf16.hpp"

@@ -28,7 +28,9 @@
 // reported as that coincidence rather than skipped.  The control needs a row long enough for the two layouts to
 // group blocks differently: IQ4_XS takes 16 blocks per iteration with 4 warps and 8 with 2, so at n_in = 2048 (8
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/iq_kernels.hpp"

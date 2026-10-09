@@ -23,9 +23,12 @@
 // the projection.  Bitwise equality with the previous kernels is the contract; on top of it a double-precision
 // host reference of every up row and every down row checks that the fixture computes an expert at all - two
 // kernels agreeing on garbage would otherwise pass.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
@@ -662,10 +665,8 @@ void bench() {
         ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "sync");
         float ms = 0;
         ck(DPCT_CHECK_ERROR(
-               ms = (e1->get_profiling_info<
-                         sycl::info::event_profiling::command_end>() -
-                     e0->get_profiling_info<
-                         sycl::info::event_profiling::command_start>()) /
+               ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                     strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                     1000000.0f),
            "elapsed");
         return 1000.0 * ms / ITERS;

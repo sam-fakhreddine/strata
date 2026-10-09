@@ -4,7 +4,9 @@
 // Real geometry (n_embd 2560, hc 4, hc_lr 320), the pinned native MMVF path, every T = 1..8, with and without an
 // injection weight (a layer read vs the final mixer), and the write both out of place and in place (R_out == R).
 // Each output of the multi call must equal the token-by-token one bit for bit. GPU, synthetic, no model.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/gr.hpp"

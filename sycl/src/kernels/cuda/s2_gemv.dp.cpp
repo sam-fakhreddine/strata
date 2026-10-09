@@ -3,7 +3,9 @@
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is
 // still right.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/s2_gemv.hpp"

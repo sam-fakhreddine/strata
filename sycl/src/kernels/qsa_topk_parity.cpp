@@ -9,9 +9,12 @@
 //
 // Usage: qsa_topk_parity --selftest
 //        qsa_topk_parity CONTEXT [QUERIES=256] [REPS=10] [CAPACITY=CONTEXT] [COUNT=1]   (COUNT=0: no block count)
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 
@@ -153,10 +156,8 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
         ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
         float ms = 0;
         ck(DPCT_CHECK_ERROR(
-               ms = (e1->get_profiling_info<
-                         sycl::info::event_profiling::command_end>() -
-                     e0->get_profiling_info<
-                         sycl::info::event_profiling::command_start>()) /
+               ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                     strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                     1000000.0f),
            "elapsed");
         return ms / (float) reps;

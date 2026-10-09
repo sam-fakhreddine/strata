@@ -5,7 +5,9 @@
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/cvec.hpp"
