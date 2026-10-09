@@ -38,7 +38,12 @@ public:
     /// The blob gathered straight into `dst` (bytes = the layer's blob size), from any thread: no ring slot, so the
     /// prompt path's stager threads read the streamed experts themselves instead of holding ring pointers that a
     /// later blob() call overwrites (the 80k-token run of 2026-09-30 streamed ~1,900 blobs per chunk through 512 slots).
-    bool read_into(int64_t layer, int64_t expert, uint8_t* dst, size_t bytes) const;
+    /// `drop_cache`: the file ranges just read are released from the page cache (posix_fadvise DONTNEED); the fill
+    /// and the mirror pass `fill_fadvise()`, every other caller leaves the cache alone.
+    bool read_into(int64_t layer, int64_t expert, uint8_t* dst, size_t bytes, bool drop_cache = false) const;
+    /// STRATA_FILL_FADVISE set and not "0": the profile fill and the mirror give the page cache back as they read
+    /// (a VM shared with other services keeps its cache; the default evicts theirs on a 35-50 GB start).
+    static bool fill_fadvise();
     int64_t reads() const override { return reads_; }
 
     /// SYCL port, plan item 2: the experts that did not fit the VRAM cache, read once into pinned host memory the

@@ -4551,6 +4551,9 @@ int main(int argc, char **argv) try {
                 return 1;
             }
             const int nthreads = std::max(2, std::min(8, (int) std::thread::hardware_concurrency()));
+            // STRATA_FILL_FADVISE=1: each slice read for the fill is dropped from the page cache right after its pread
+            // (inside read_into, where the fd and offsets are), so the fill does not evict a co-tenant's cache
+            const bool drop_cache = strata::core::GgufExpertSource::fill_fadvise();
             sycl::event done[2];
             bool read_ok = true;
             for (size_t b0 = 0, k = 0; b0 < fills.size() && read_ok; b0 += kBatch, ++k) {
@@ -4564,7 +4567,7 @@ int main(int argc, char **argv) try {
                     ts.emplace_back([&] {
                         for (size_t j; (j = next.fetch_add(1)) < n;) {
                             const Fill& f = fills[b0 + j];
-                            if (!gguf_src.read_into(f.l, f.e, set + j * blob_cap, blob_cap)) ok = false;
+                            if (!gguf_src.read_into(f.l, f.e, set + j * blob_cap, blob_cap, drop_cache)) ok = false;
                         }
                     });
                 for (auto& t : ts) t.join();
@@ -4684,7 +4687,8 @@ int main(int argc, char **argv) try {
     }
     // SYCL port, plan item 2: the experts that did not fit VRAM, mirrored once in pinned host memory the GPU reads
     // over PCIe (--stream-experts has no host copy otherwise: each routed miss was an SSD read). The share of misses
-    // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
+    // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: the RAM this process can get, the
+    // cgroup-aware host_available_memory figure, less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
     int64_t unmirrored_misses = 0;
     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
@@ -4693,14 +4697,23 @@ int main(int argc, char **argv) try {
         // miss: 20 GiB of RAM for experts the other card then holds, or one 39 GiB pinned allocation that fails).
         const int64_t mirror_end = multi_gpu && !split_at.empty() ? split_at[0] : g.n_layers;
         std::vector<std::pair<int64_t, int64_t>> miss;
+        // `seen` indexed by layer * n_expert + expert: the sweep below asks "already listed" in O(1) instead of a
+        // std::find over the list (O(N^2) over up to 24,576 pairs, ~0.5-1 s per start); the list is the same, in
+        // the same order
+        std::vector<uint8_t> seen((size_t) (mirror_end * g.n_expert), 0);
         for (const auto& pr : profile)   // the profile's order: the most-routed misses first, if the cap is reached
-            if (pr.first < mirror_end && xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident)
+            if (pr.first < mirror_end && xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident) {
                 miss.push_back({pr.first, pr.second});
+                if (pr.first >= 0 && pr.second >= 0 && pr.second < g.n_expert)
+                    seen[(size_t) (pr.first * g.n_expert + pr.second)] = 1;
+            }
         for (int64_t l = 0; l < mirror_end; ++l)                     // pairs the profile does not list at all
             for (int64_t e = 0; e < g.n_expert; ++e)
-                if (xcache.slot_of(l, e) == strata::core::kNotResident &&
-                    std::find(miss.begin(), miss.end(), std::pair<int64_t, int64_t>{l, e}) == miss.end())
+                if (xcache.slot_of(l, e) == strata::core::kNotResident && !seen[(size_t) (l * g.n_expert + e)])
                     miss.push_back({l, e});
+        // The default cap: the RAM this process can get (MemAvailable lowered to the room under the tightest cgroup
+        // limit, host_available_memory, bytes) less 4 GiB. MemAvailable alone over-committed on a VM shared with other
+        // services whose cgroups bound this process; it stays the fallback when the cgroup tree cannot be read.
         uint64_t avail = 0;
         if (FILE* f = std::fopen("/proc/meminfo", "r")) {
             char key[64]; unsigned long long kb = 0;
@@ -4708,8 +4721,17 @@ int main(int argc, char **argv) try {
                 if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb << 10; break; }
             std::fclose(f);
         }
+        const char* cap_source = "MemAvailable less 4 GiB";
+        if (strata::core::detail::HostMemory hm; strata::core::detail::host_available_memory(hm) && hm.available > 0) {
+            if (hm.available < avail || avail == 0) {
+                avail = hm.available;
+                if (hm.cgroup_limit != ~uint64_t{0}) cap_source = "the cgroup limit less 4 GiB";
+            }
+        }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
         const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        std::fprintf(stderr, "strata generate: mirror cap %llu MiB from %s\n", (unsigned long long) (cap >> 20),
+                     mv ? "STRATA_MIRROR_MIB" : cap_source);
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);

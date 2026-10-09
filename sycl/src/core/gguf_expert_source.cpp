@@ -2,6 +2,7 @@
 #include "strata/core/gguf_expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
@@ -140,11 +141,12 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     std::atomic<size_t> next{0};
     std::atomic<bool> bad{false};
     std::vector<std::thread> ts;
+    const bool drop = fill_fadvise();   // STRATA_FILL_FADVISE=1: the page cache is given back after each read
     for (int i = 0; i < std::max(1, threads); ++i)
         ts.emplace_back([&] {
             for (size_t j; (j = next.fetch_add(1)) < take.size() && !bad.load();) {
                 const auto [l, e] = take[j];
-                if (!read_into(l, e, base + offs[j], (size_t) lay.bytes[(size_t) l])) bad.store(true);
+                if (!read_into(l, e, base + offs[j], (size_t) lay.bytes[(size_t) l], drop)) bad.store(true);
             }
         });
     for (auto& th : ts) th.join();
@@ -181,7 +183,12 @@ const uint8_t* GgufExpertSource::device_alias(int64_t layer, int64_t expert) con
     return f >= 0 ? mirror_ + f : nullptr;
 }
 
-bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, size_t bytes) const {
+bool GgufExpertSource::fill_fadvise() {
+    const char* v = std::getenv("STRATA_FILL_FADVISE");
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+}
+
+bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, size_t bytes, bool drop_cache) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_ || dst == nullptr) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const auto& fm = lay.fmt[(size_t) layer];
@@ -198,6 +205,14 @@ bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, si
             if (n <= 0) return false;
             done += (uint64_t) n;
         }
+#if defined(POSIX_FADV_DONTNEED)
+        // STRATA_FILL_FADVISE=1 (the fill and the mirror): the slice just read is dropped from the page cache so a
+        // 35-50 GB start does not evict a co-tenant's cache. The read sizes and order are unchanged; the advice is
+        // best effort, so its result is not checked.
+        if (drop_cache) (void) ::posix_fadvise(fd, (off_t) src, (off_t) per[r], POSIX_FADV_DONTNEED);
+#else
+        (void) drop_cache;
+#endif
     }
     return true;
 }
