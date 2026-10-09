@@ -297,7 +297,8 @@ beside the hit rate.
 **Where a decode window's time goes (profiling, #610):** start the server with `STRATA_DECODE_TIMING=1` (and
 `STRATA_VERIFY_PROFILE=1` for the GPU's side) in the environment. After each request the engine log then has one
 `strata decode timing:` line - windows, tokens per window, and per window the verify time split into the wait for the
-GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft - and one
+GPU, the CPU expert pool (plan, activation quantization, jobs) and the stage, plus commit and draft (on the SYCL
+port also the window graph's node count and the mean microseconds per node, verify ms over the nodes) - and one
 `strata decode GPU stages (ms/window):` line with the GPU time of each stage (GDN and QSA layers, the VRAM expert
 hits, the router, the head, ...). The GPU profile times every stage with events, so it slows the decode a little:
 use it to compare, not to measure speed. This works with every pack; `--gpu-stages` (a one-token replay of

@@ -10285,12 +10285,12 @@ int main(int argc, char **argv) try {
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
-                int64_t misses, entries, hits, pcie;
+                int64_t misses, entries, hits, pcie, nodes;
             };
             auto dec_snap = [&]() {
                 return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
                                drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
-                               drive.d.pcie_experts};
+                               drive.d.pcie_experts, ver.graph_nodes};
             };
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
@@ -11173,15 +11173,20 @@ int main(int argc, char **argv) try {
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
+                // the window graph's node count and the mean us a node took (verify ms over the nodes replayed): the
+                // launch-gap share of a window is at most this many us a node (0 nodes: eager windows, no graph)
+                const double nodes_w = (double) (d1.nodes - ds0.nodes) / w;
+                const double us_node = nodes_w > 0 ? dt_run / w * 1000.0 / nodes_w : 0.0;
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
-                                     "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
-                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f\n",
+                                     "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; graph %.0f nodes/window, "
+                                     "%.2f us/node; per layer-window: CPU experts %.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f\n",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
-                             (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
-                             (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                             (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, nodes_w, us_node,
+                             (d1.misses - ds0.misses) / (w * L), (d1.entries - ds0.entries) / (w * L),
+                             (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
