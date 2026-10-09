@@ -76,5 +76,10 @@ void native_expert_set_mode(int mode, int phase);
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+/// SYCL port only (no CUDA / HIP definition): superblocks per work-group of `iq_dequant_f16` / `iq_dequant_gu_f16`,
+/// 1, 2, 4 or 8 (STRATA_DEQUANT_WG at startup; 1 = one 32-lane group per superblock). Every value writes bitwise
+/// the same bytes (iq_multi_parity checks it); the setter is for dequant_bench and that test, other values read as 1.
+void iq_dequant_set_wg(int n);
+int iq_dequant_wg();
 
 }  // namespace strata::kernels

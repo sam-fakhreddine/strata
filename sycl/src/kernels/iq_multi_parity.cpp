@@ -610,6 +610,76 @@ void check_q8_1_finite(dpct::queue_ptr s, std::mt19937 &rng) {
     sycl::free(dq, dpct::get_in_order_queue());
 }
 
+// ------------------------------------------------------------------------------------------------ (3) dequant WG
+// The prompt path's expert dequant (iq_dequant_gu_f16, one expert's gate and up of n_ff x n_embd, and iq_dequant_f16,
+// its down matrix) with STRATA_DEQUANT_WG 2, 4 and 8 (N superblocks per work-group, iq_dequant_set_wg) against 1,
+// the default: bitwise. The output is filled with 0xFFFF (a NaN no finite decode produces) first, so a superblock a
+// variant skipped shows as a mismatch; an n_ff whose superblock count is not a multiple of 8 exercises the tail guard.
+void check_dequant_wg(int t, int64_t n_embd, int64_t n_ff, dpct::queue_ptr s, std::mt19937 &rng) {
+    const int64_t gu_n = 2 * n_ff * n_embd, d_n = n_embd * n_ff;   // fp16 values written
+    const auto g = random_rows(t, n_ff, n_embd, rng), u = random_rows(t, n_ff, n_embd, rng),
+               d = random_rows(t, d_n / 256, 256, rng);   // the down matrix is read as contiguous superblocks
+    uint8_t *dg = dalloc<uint8_t>(g.size()), *du = dalloc<uint8_t>(u.size()), *dd = dalloc<uint8_t>(d.size());
+    auto upload = [](uint8_t* p, const std::vector<uint8_t>& h) {
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
+                                .memcpy(p, h.data(), h.size())
+                                .wait()),
+           "blocks");
+    };
+    upload(dg, g);
+    upload(du, u);
+    upload(dd, d);
+    uint16_t* out = dalloc<uint16_t>((size_t) (gu_n + d_n));
+    std::vector<uint16_t> ref((size_t) (gu_n + d_n)), got(ref.size());
+    const int was = k::iq_dequant_wg();
+    auto run = [&](int wg, std::vector<uint16_t>& to) {
+        k::iq_dequant_set_wg(wg);
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
+                                .memset(out, 0xFF, to.size() * 2)
+                                .wait()),
+           "fill");
+        k::iq_dequant_gu_f16(t, dg, du, n_ff, n_embd, out, s);
+        k::iq_dequant_f16(t, dd, d_n, out + gu_n, s);
+        s->wait();
+        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
+                                .memcpy(to.data(), out, to.size() * 2)
+                                .wait()),
+           "out");
+    };
+    run(1, ref);
+    // non-vacuity: the default must have written every value (no fill pattern left) and the values must vary
+    size_t unwritten = 0;
+    for (uint16_t v : ref) unwritten += v == 0xFFFF;
+    std::vector<uint16_t> head(ref.begin(), ref.begin() + std::min<size_t>(ref.size(), 4096));
+    std::sort(head.begin(), head.end());
+    const size_t distinct = (size_t) (std::unique(head.begin(), head.end()) - head.begin());
+    int bad = 0;
+    for (int wg : {2, 4, 8}) {
+        run(wg, got);
+        size_t nd = 0, first = ref.size();
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (got[i] != ref[i]) { if (nd == 0) first = i; ++nd; }
+        if (nd) {
+            std::printf("  %-8s dequant wg %d: %zu of %zu fp16 values differ from wg 1, first at %zu (%s superblock %zu): "
+                        "wg 1 %04x, wg %d %04x\n", name_of(t), wg, nd, ref.size(), first,
+                        first < (size_t) gu_n ? "gate/up" : "down",
+                        (first < (size_t) gu_n ? first : first - (size_t) gu_n) / 256, ref[first], wg, got[first]);
+            ++bad;
+        }
+    }
+    k::iq_dequant_set_wg(was);
+    const bool vacuous = unwritten != 0 || distinct < 16;
+    std::printf("%-8s dequant %lld x %lld gate/up + down: wg 2/4/8 against 1 %s (%lld + %lld superblocks, %zu distinct "
+                "values in the first 4096, %zu unwritten)\n", name_of(t), (long long) n_ff, (long long) n_embd,
+                bad || vacuous ? "FAIL" : "bitwise", (long long) (n_ff * n_embd / 256), (long long) (d_n / 256), distinct,
+                unwritten);
+    g_fail += bad + (vacuous ? 1 : 0);
+    sycl::free(dg, dpct::get_in_order_queue());
+    sycl::free(du, dpct::get_in_order_queue());
+    sycl::free(dd, dpct::get_in_order_queue());
+    sycl::free(out, dpct::get_in_order_queue());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -625,6 +695,10 @@ int main(int argc, char** argv) {
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
+    }
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
+        check_dequant_wg(t, 2560, 67, s, rng);     // 670 superblocks a role: a tail for every N
+        check_dequant_wg(t, 2560, 1280, s, rng);   // the model's expert shape (12,800 a role, no tail)
     }
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);

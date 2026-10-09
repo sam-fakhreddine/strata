@@ -2773,6 +2773,36 @@ __dpct_inline__ void dequant_gu_kernel(
                             item_ct1.get_local_id(2));
 }
 
+// SYCL port: the same two kernels with N consecutive superblocks per work-group (STRATA_DEQUANT_WG=N, N in 2/4/8;
+// the launchers above stay the default). The group has 32*N lanes and reqd_sub_group_size(32), so local id / 32 is
+// the sub-group id and local id % 32 the lane in it (DPC++ forms sub-groups from consecutive work-items of a 1-D
+// range). Sub-group k of group g takes superblock N*g + k with the lane mapping of the one-superblock kernel, so
+// every lane computes and stores the same bytes to the same addresses; only how many sub-groups share a thread
+// group changes (a 32-lane group is one sub-group on Xe2, which wants 4-8 per thread group to hide latency). The
+// last group's sub-groups past the end return before they touch anything.
+template <typename dst_t, int N>
+__dpct_inline__ void dequant_flat_wg_kernel(
+    int ty, const void *__restrict__ vx, dst_t *__restrict__ y, int64_t n_sb) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lid = item_ct1.get_local_id(2);
+    const int64_t i = (int64_t) item_ct1.get_group(2) * N + lid / 32;
+    if (i >= n_sb) return;
+    dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, lid % 32);
+}
+template <int N>
+__dpct_inline__ void dequant_gu_wg_kernel(
+    int ty, const void *__restrict__ gate, const void *__restrict__ up,
+    int64_t per_row, int64_t n_sb, sycl::half *__restrict__ y) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lid = item_ct1.get_local_id(2);
+    const int64_t i = (int64_t) item_ct1.get_group(2) * N + lid / 32;
+    if (i >= n_sb) return;
+    const int parity = item_ct1.get_group(1);
+    const int64_t r = i / per_row, c = i % per_row;
+    dq_dispatch<sycl::half>(ty, parity ? up : gate, i,
+                            y + ((2 * r + parity) * per_row + c) * QK_K, lid % 32);
+}
+
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
@@ -2820,6 +2850,15 @@ bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 // every format; STRATA_EXPERT_SPLIT=1 takes upstream's multi kernels, launched with their own grid (GU_ROWS rows).
 bool g_split_multi = env_on("STRATA_EXPERT_SPLIT");
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
+// STRATA_DEQUANT_WG=N (1, 2, 4 or 8; unset or 1 = today's one superblock per 32-lane group): superblocks per
+// work-group in the prompt path's expert dequant (iq_dequant_f16 / iq_dequant_gu_f16). N > 1 takes
+// dequant_flat_wg_kernel / dequant_gu_wg_kernel, bitwise the same bytes. Read once at startup; iq_dequant_set_wg
+// (dequant_bench, iq_multi_parity) changes it afterwards. Unmeasured candidate (docs/INTEL.md).
+int dequant_wg_valid(int n) { return n == 1 || n == 2 || n == 4 || n == 8 ? n : 1; }
+int g_dequant_wg = [] {
+    const char* v = std::getenv("STRATA_DEQUANT_WG");
+    return dequant_wg_valid(v && v[0] != '\0' ? std::atoi(v) : 1);
+}();
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
@@ -4224,6 +4263,8 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+void iq_dequant_set_wg(int n) { g_dequant_wg = dequant_wg_valid(n); }
+int iq_dequant_wg() { return g_dequant_wg; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
@@ -4289,8 +4330,58 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     check("iq_mmvq");
 }
 
+namespace {
+// STRATA_DEQUANT_WG = N > 1: ceil(superblocks / N) groups of 32*N lanes, one sub-group per superblock
+// (dequant_flat_wg_kernel / dequant_gu_wg_kernel). The default launches below are untouched.
+template <typename dst_t, int N>
+void launch_dequant_flat_wg(int t, const void* src, int64_t n_sb, dst_t* dst, void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    const size_t groups = (size_t) ((n_sb + N - 1) / N);
+    strata::q_of(stream)->parallel_for<dpct_kernel_name<class dequant_flat_wg_kernel_sg, dst_t, dpct_kernel_scalar<N>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, groups * 32 * N), sycl::range<3>(1, 1, 32 * N)), exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            dequant_flat_wg_kernel<dst_t, N>(t, src, dst, n_sb);
+        });
+}
+template <typename dst_t>
+void launch_dequant_flat_wgn(int wg, int t, const void* src, int64_t n_sb, dst_t* dst, void* stream) {
+    switch (wg) {
+        case 2: launch_dequant_flat_wg<dst_t, 2>(t, src, n_sb, dst, stream); break;
+        case 4: launch_dequant_flat_wg<dst_t, 4>(t, src, n_sb, dst, stream); break;
+        case 8: launch_dequant_flat_wg<dst_t, 8>(t, src, n_sb, dst, stream); break;
+        default: std::fprintf(stderr, "iq_dequant: STRATA_DEQUANT_WG %d is not 2, 4 or 8\n", wg); std::exit(1);
+    }
+}
+template <int N>
+void launch_dequant_gu_wg(int t, const void* gate, const void* up, int64_t per_row, int64_t n_sb, sycl::half* dst,
+                          void* stream) {
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    const size_t groups = (size_t) ((n_sb + N - 1) / N);
+    strata::q_of(stream)->parallel_for<dpct_kernel_name<class dequant_gu_wg_kernel_sg, dpct_kernel_scalar<N>>>(
+        sycl::nd_range<3>(sycl::range<3>(1, 2, groups * 32 * N), sycl::range<3>(1, 1, 32 * N)), exp_props,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            dequant_gu_wg_kernel<N>(t, gate, up, per_row, n_sb, dst);
+        });
+}
+void launch_dequant_gu_wgn(int wg, int t, const void* gate, const void* up, int64_t per_row, int64_t n_sb,
+                           sycl::half* dst, void* stream) {
+    switch (wg) {
+        case 2: launch_dequant_gu_wg<2>(t, gate, up, per_row, n_sb, dst, stream); break;
+        case 4: launch_dequant_gu_wg<4>(t, gate, up, per_row, n_sb, dst, stream); break;
+        case 8: launch_dequant_gu_wg<8>(t, gate, up, per_row, n_sb, dst, stream); break;
+        default: std::fprintf(stderr, "iq_dequant_gu_f16: STRATA_DEQUANT_WG %d is not 2, 4 or 8\n", wg); std::exit(1);
+    }
+}
+}  // namespace
+
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (g_dequant_wg > 1) {
+        dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
+        launch_dequant_flat_wgn<sycl::half>(g_dequant_wg, t, src, n / 256, (sycl::half*) dst, stream);
+        check("iq_dequant_f16");
+        return;
+    }
     {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -4391,6 +4482,12 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
+    if (g_dequant_wg > 1) {
+        dpct::has_capability_or_fail(strata::q_of(stream)->get_device(), {sycl::aspect::fp16});
+        launch_dequant_gu_wgn(g_dequant_wg, t, gate, up, per_row, n_ff * per_row, (sycl::half*) dst, stream);
+        check("iq_dequant_gu_f16");
+        return;
+    }
     {
 
         auto exp_props = sycl::ext::oneapi::experimental::properties{

@@ -1,6 +1,8 @@
 // sycl/src/kernels/dequant_bench.cpp - time the prompt path's expert dequantizers (iq_dequant_gu_f16 / iq_dequant_f16)
 // on random blocks and print a hash of the FP16 output, so two builds can be compared bit for bit.
-//   dequant_bench [type|all] [experts]       (gate/up 1280 x 2560 and down 2560 x 1280 per expert, the model's shape)
+//   dequant_bench [type|all] [experts] [wg]  (gate/up 1280 x 2560 and down 2560 x 1280 per expert, the model's shape)
+// `wg` (or STRATA_DEQUANT_WG=N in the environment) is the superblocks per work-group, 1, 2, 4 or 8; the hashes must not
+// change with it:  STRATA_DEQUANT_WG=4 ./dequant_bench 21   against   ./dequant_bench 21
 #include "strata/kernels/iq_kernels.hpp"
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -26,6 +28,8 @@ uint64_t fnv(const uint16_t* p, size_t n) {
 int main(int argc, char** argv) {
     const int want = argc > 1 && std::strcmp(argv[1], "all") != 0 ? std::atoi(argv[1]) : -1;
     const int experts = argc > 2 ? std::atoi(argv[2]) : 32;
+    if (argc > 3) strata::kernels::iq_dequant_set_wg(std::atoi(argv[3]));   // else the environment's (1 unless set)
+    const int wg = strata::kernels::iq_dequant_wg();
     const int64_t n_ff = 1280, n_embd = 2560;
     sycl::queue* s = &dpct::get_in_order_queue();
     for (const Ty& t : kTypes) {
@@ -64,8 +68,9 @@ int main(int argc, char** argv) {
         const uint64_t h0 = fnv(ho.data(), gu_out + d_out);
         s->memcpy(ho.data(), dst + (size_t) (experts - 1) * (gu_out + d_out), (gu_out + d_out) * 2).wait();
         const uint64_t h1 = fnv(ho.data(), gu_out + d_out);
-        std::printf("%-8s %2d experts: median %7.2f ms  write %6.1f GB/s  (read %5.1f GB/s)  hash %016llx %016llx\n", t.name,
-                    experts, med, wr / med / 1e6, rd / med / 1e6, (unsigned long long) h0, (unsigned long long) h1);
+        std::printf("%-8s %2d experts, wg %d: median %7.2f ms  write %6.1f GB/s  (read %5.1f GB/s)  hash %016llx %016llx\n",
+                    t.name, experts, wg, med, wr / med / 1e6, rd / med / 1e6, (unsigned long long) h0,
+                    (unsigned long long) h1);
         sycl::free(src, *s);
         sycl::free(dst, *s);
     }

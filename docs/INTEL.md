@@ -801,6 +801,11 @@ on this card for this model is the dequant kernels (at ~200 GB/s against a 600 G
 prompt attention (14%); the multi-column int8 DPAS decode kernels of llama.cpp PR 29864 target K-quant and Q8_0 weights, not
 the IQ-quant experts, and were not ported.
 
+**Dequant work-group size (candidate, not measured).** `STRATA_DEQUANT_WG=N` (2, 4 or 8; unset or 1 is today's one 32-lane
+group per 256-value superblock) runs N superblocks per work-group in the expert dequant, one sub-group each with the same lane
+mapping, so the bytes written are bitwise the same (`iq_multi_parity` checks 1 against 4 and 8, `dequant_bench [type] [experts] [wg]`
+prints the hash): a 32-lane group is one sub-group on Xe2, and the hardware wants 4-8 per thread group to hide store latency.
+
 ## Measured, 2026-10-01, Arc Pro B70, Coder IQ1_M, 32K context, INT8 KV: the SYCL port (engine 0.1.31-sycl)
 
 | | |
