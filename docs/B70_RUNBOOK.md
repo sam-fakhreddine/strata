@@ -143,7 +143,7 @@ cd /opt/llm/models/strata/IQ2_XS
 for i in 1 2; do curl -L --fail --retry 5 -C - -o Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-0000$i-of-00002.gguf "$R/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-0000$i-of-00002.gguf"; done
 ```
 
-Hash check (setup.py does none for this family): read each file's LFS oid from `https://huggingface.co/api/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS` (field `lfs.oid`), compare with `sha256sum`, and check that the two sizes sum to 68,015,068,160 bytes (`data/gguf_fingerprints.json`, `qwen/IQ2_XS`). Write `<file>.sha256` beside each file. Shard 2 is the `per_layer_token_embd` table shared by every quant of this model: hard-link it if another quant is ever downloaded.
+Hash check (setup.py does none for this family): read each file's LFS oid from `https://huggingface.co/api/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/ed59f92082b1e93c0e96d60a8b11aab089b52f09/IQ2_XS` (field `lfs.oid`), compare with `sha256sum` (the check that matters; the oid is the file's sha256). `data/gguf_fingerprints.json` (`qwen/IQ2_XS`, `bytes` 68,015,068,160) counts tensor bytes only: the two files are about 11 MB larger (68,026,093,024 measured 2026-10-09) because of the GGUF headers and metadata, so do not compare file sizes with it. Write `<file>.sha256` beside each file. Shard 2 is the `per_layer_token_embd` table shared by every quant of this model: hard-link it if another quant is ever downloaded.
 
 Pack and MTP (the engine's own tools, in the repo's `.venv` from `setup.sh`, or any Python 3.10+ with `numpy`):
 
@@ -178,10 +178,10 @@ build-all/strata --pack /opt/llm/strata/packs/iq2_xs \
   --expert-profile data/expert-profile.bin --expert-cache auto --stream-experts \
   --prefill 4096 --spec 4 --spec-min-p 0.5 --mtp /opt/llm/strata/mtp-bf16/rt \
   --max-context 32768 --kv int8 --vram-reserve-mib 1024 --ple-io direct \
-  --tokens <ids file> --max-new 256 --greedy
+  --tokens-file <ids file> --max-new 256 --greedy
 ```
 
-Read the start lines: `N experts resident` (expect about 18.3k for IQ2_XS), `MiB of VRAM free with everything loaded` (must not say `LOW`), `mirror cap N MiB from ...` (d9), the mirror size and fill time (about 8.4 GiB), `WARN` lines about aliased arena pages (the engine retries by itself), the `PCIe probe` line (expect well above 26 GB/s on the Gen5 x16 link). Expected decode on IQ2_XS: 55 to 70 tok/s on the 20-token prompt, from the author's Gen5 figures. Anything under 45 means the mirror is being read more than planned: turn on `STRATA_MIRROR_STATS=1` (d7).
+Read the start lines: `N experts resident` (expect about 18.3k for IQ2_XS), `MiB of VRAM free with everything loaded` (must not say `LOW`), `mirror cap N MiB from ...` (d9), the mirror size and fill time (about 8.4 GiB), `WARN` lines about aliased arena pages (the engine retries by itself), the `PCIe probe` line (about 35 GB/s on the Gen5 x16 link with the probe fix, `fix/sycl-pcie-probe-pinned`, upstream #1746; without it the probe times a pageable copy and reads about 6 to 8 GB/s, which sets `pcie_frac` near 0.2: pass `--pcie-frac 0.55` until the fix is in). Expected decode on IQ2_XS: 55 to 70 tok/s on the 20-token prompt, from the author's Gen5 figures; measured 2026-10-09 on our B70: 60.5 (reference binary) to 64 (AOT `b70-all`). The token files are comma-separated ids; the community prompts `bench/results/2026-10-07-community-arc-b65-v01402/benchy-short.ids` (20 tokens) and `benchy-long.ids` (2,185) are the 20-token and 2,185-token prompts below. Anything under 45 means the mirror is being read more than planned: turn on `STRATA_MIRROR_STATS=1` (d7).
 
 ### 5.2 Served (the production shape)
 
@@ -206,7 +206,7 @@ Operationally, the homelab side still owns the switch: until Steward has an `llm
 ### 5.3 Timings through the API
 
 ```sh
-python sycl/tools/strata_timings.py --url http://127.0.0.1:8097 --suite tools/b70-tuning/prompts/suite.json --runs 3
+python sycl/tools/strata_timings.py --base http://127.0.0.1:8097 --suite tools/b70-tuning/prompts/suite.json --repeat 3 --out timings.json
 ```
 
 (the suite file is in the homelab repo, `tools/b70-tuning/prompts/suite.json`; the driver is standard library only and prints each response's `timings.prompt_per_second` and `timings.predicted_per_second` plus a median row.)
