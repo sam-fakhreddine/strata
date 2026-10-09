@@ -167,7 +167,7 @@ container. Three files in `sycl/serve/` and `sycl/tools/` are for that:
   config's `"env"` unsets one) and runs `build-sycl-aot/strata` or `build-sycl/strata` (`STRATA_SYCL_BIN` overrides)
   with the serve pipes attached. The config's args are host paths; the engine's stderr goes to the config's `"log"`.
 - `sycl/serve/strata-flash.json.example`: a serve config for Flash-Next IQ2_XS on a 32 GB card with that `exe`,
-  files under `/opt/llm/strata`. Prompt borrowing is the engine's default (`--no-prefill-borrow` turns it off), so no flag.
+  files under `/opt/llm/strata`. At `--max-context 32768` the prompt path keeps its own buffers (about 2.9 GiB; the engine borrows cache slots by default only above 32K); `--prefill-borrow` forces borrowing and gives those slots to the expert cache at the cost of a refill after each prompt, the choice for a quant that does not fit (`docs/B70_TUNING.md`).
 - `sycl/serve/strata-flash.service.example`: a systemd unit for a VM that shares the card with other model servers
   (`Conflicts=` on every unit that can own it, an `ExecStartPre` that refuses to start unless the power cap reads 180 W,
   the API key from a 0600 `EnvironmentFile`, `--host 127.0.0.1 --port 8097`).
