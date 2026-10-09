@@ -8,7 +8,9 @@
 // same arithmetic over the device's own image to 1e-4 of scale.  Everything that is not rounding is bitwise: the
 // BF16 image of `mixed` and its low part follow the kernel's rounding rule exactly, and the FP16 image is the RTE
 // half of the FP32 value.  Both xn16 token strides (10240 and 10240 + 64) and both low-part modes run.
+#ifdef STRATA_SYCL_PROFILING_QUEUES   // D1: the CMake option decides, as in every other translation unit
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/prefill/kernels.hpp"
