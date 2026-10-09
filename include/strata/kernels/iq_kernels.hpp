@@ -82,4 +82,10 @@ bool iq_old_kernels();
 void iq_dequant_set_wg(int n);
 int iq_dequant_wg();
 
+/// SYCL port: the opt-in decode-once lane paths of the grouped expert kernels, type 17 (IQ2_XS, STRATA_IQ2XS_MULTI=1
+/// at startup) and type 29 (IQ1_M, STRATA_IQ1M_MULTI=1); bitwise the per-entry path.  Other types are ignored.  Set
+/// before graph capture.  Defined by the port only (sycl/); nothing in the CUDA build calls them.
+void iq_set_multi_opt_in(int type, bool on);
+bool iq_multi_opt_in(int type);
+
 }  // namespace strata::kernels
