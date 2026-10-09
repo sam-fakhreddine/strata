@@ -768,10 +768,19 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
-    // ---- the window's inputs, from mapped staging
-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    // ---- the window's inputs, from mapped staging.  STRATA_INPUT_COPY_MULTI=1: the three copies in one launch
+    // (`copy_from_mapped_multi`, as the drafter's capture_round), one graph node instead of three; tok_, step_ and
+    // pos_ are arena buffers and m_* the mapped aliases, all fixed for the verifier's life (graph.hpp, note 3).
+    static const bool input_multi = [] { const char* v = std::getenv("STRATA_INPUT_COPY_MULTI"); return v != nullptr && std::atoi(v) != 0; }();
+    if (input_multi) {
+        const MappedCopy in[3] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) T * kStepCount},
+                                  {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)}};
+        copy_from_mapped_multi(in, 3, cs);
+    } else {
+        copy_i32_from_mapped(tok_, m_tok_, T, cs);
+        copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
+        copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    }
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -1639,9 +1648,14 @@ bool Verifier::capture(int T, std::string &err) try {
               dpct::get_error_string_dummy(ce);
         return false;
     }
-    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
-        size_t nn = 0;
+    // the window graph's node count (STRATA_DECODE_TIMING's us per node); queried only for the switches that read it
+    static const bool count_nodes = std::getenv("STRATA_DECODE_TIMING") != nullptr || std::getenv("STRATA_VERIFY_NODES") != nullptr;
+    size_t nn = 0;
+    if (count_nodes) {
         dpct::experimental::get_nodes(graph, nullptr, &nn);
+        (ar_off_ ? nodes_nr_ : nodes_)[T] = nn;
+    }
+    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         std::vector<dpct::experimental::node_ptr> nodes(nn);
         dpct::experimental::get_nodes(graph, nodes.data(), &nn);
         std::map<std::string, int> kinds;
@@ -1910,6 +1924,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     const dpct::err0 le = (std::getenv("STRATA_VERIFY_EAGER") != nullptr)
                               ? (record_window(T, cs_, err) ? 0 : 1)   // SYCL port: eager replay of the window body
                               : DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*(ar_off_ ? exec_nr_[T] : exec_[T])));
+    graph_nodes += (int64_t) (ar_off_ ? nodes_nr_ : nodes_)[T];   // 0 when eager (no graph was captured)
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
     codes. Please replace the "get_error_string_dummy(...)" with a real
@@ -3414,6 +3429,7 @@ bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     const dpct::err0 le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_[T]));
+    graph_nodes += (int64_t) nodes_[T];
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
@@ -3694,8 +3710,10 @@ catch (sycl::exception const &exc) {
 void Verifier::absorb_stats(Verifier& o) {
     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
     windows += o.windows;
+    graph_nodes += o.graph_nodes;
     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
     o.windows = 0;
+    o.graph_nodes = 0;
     for (int k = 0; k < 2; ++k)
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;

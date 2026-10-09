@@ -1586,7 +1586,15 @@ bool argmax_rows_wanted() try {
             return false;
         return major == 8;
     }();
-    return want && multi_block_head_ops();
+    // SYCL port, STRATA_ARGMAX_MULTI=1 (set, not merely unset): the multi-block pick on this device too, whatever
+    // its version number reads (an Intel card has no sm_90 cluster kernel, so the head's greedy pick is otherwise the
+    // one-block kernel over the whole vocabulary a row).  Unset or 0: as before.  verify_parity's test_argmax holds
+    // the two kernels bitwise equal.
+    static const bool forced = [] {
+        const char* v = std::getenv("STRATA_ARGMAX_MULTI");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return (want || forced) && multi_block_head_ops();
 #endif
 }
 catch (sycl::exception const &exc) {

@@ -256,6 +256,10 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
+    /// SYCL port: the graph nodes the windows replayed so far (the T-token window graph's node count per window; 0
+    /// for an eager window and for the batch graphs).  With `ms` per window it gives the mean us per node, the
+    /// number that says what a launch gap costs here (STRATA_DECODE_TIMING).
+    int64_t graph_nodes = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
@@ -390,6 +394,7 @@ private:
         {}; // #871: the doorbell variant of a stage that is all-resident
             // otherwise
     dpct::experimental::command_graph_exec_ptr commit_exec_ = nullptr;
+    size_t nodes_[9] = {}, nodes_nr_[9] = {};   ///< node counts of exec_[T] / exec_nr_[T], from capture()
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
