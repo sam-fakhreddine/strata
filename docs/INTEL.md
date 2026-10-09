@@ -811,6 +811,25 @@ group per 256-value superblock) runs N superblocks per work-group in the expert 
 mapping, so the bytes written are bitwise the same (`iq_multi_parity` checks 1 against 4 and 8, `dequant_bench [type] [experts] [wg]`
 prints the hash): a 32-lane group is one sub-group on Xe2, and the hardware wants 4-8 per thread group to hide store latency.
 
+**Mirror prefetch (candidate, not measured).** `STRATA_PF_SLOTS=S` (default unset or 0: off, nothing allocated, the window
+graph as today) gives every layer a ring of S VRAM slots outside the expert cache (S x 48 x 1.97 MB: 756 MiB at S=8 for IQ3_S,
+allocated before the cache auto-sizing so the sizing sees it as taken; the start-up log says how much). Inside the captured
+window, right after layer l's routing and plan, the verifier runs layer l+1's router (`ffn_gate_inp` of l+1) on layer l's MoE
+input (the prediction upstream's host `RouterLookahead` makes, here on the device with the same router launches), and two
+kernels (`mirror_prefetch`, next to `fetch_blobs`) select the predicted experts that are mirrored and not yet in the ring
+(deduped, at most S, slots round-robin, slots holding an expert predicted this round are kept) and copy them from the pinned
+mirror into the ring with coalesced 16-byte loads. `resident_plan` then points a mirrored expert at its ring slot when the ring
+holds it, else at the mirror as before; the expert kernels read the same bytes either way, so the output is identical by
+construction. Everything is on the main in-order queue (`STRATA_PF_QUEUE=main`, the only form built: the copy's time is on the
+critical path; `side` is accepted and falls back to main), with no host handshake, graph update or flag wait. It needs
+`STRATA_VERIFY_DEVICE_PLAN=1` and a mirror (`--stream-experts` from the GGUF). The gate is `STRATA_MIRROR_STATS=1`, whose
+per-request line gains `ring hits N of M mirrored entries (x%), copies C`: the hit rate of `router(l+1)` on `x(l)` and the
+yield of the copies, which decide whether the bandwidth the copies take is paid back; measure tokens identical and tok/s on a
+forced-miss run (`--expert-cache 8000` on IQ2_XS) at S=0, 8 and 16 before IQ3_S. Tests: `resident_plan_parity` (a mirror and a
+ring table: ring pointer when held, mirror pointer otherwise, the plan memcmp-equal, the stats words) and
+`mirror_prefetch_parity` (the select and copy kernels against a host replay over host-USM blobs of random bytes: slot bytes
+equal their source, no expert in two slots, at most S copies, a repeat prediction copies nothing).
+
 ## Measured, 2026-10-01, Arc Pro B70, Coder IQ1_M, 32K context, INT8 KV: the SYCL port (engine 0.1.31-sycl)
 
 | | |
