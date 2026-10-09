@@ -870,6 +870,20 @@ __dpct_inline__ void rebase_ptrs_kernel(unsigned long long *ptr,
     if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
+// T2a: fetch_blobs_kernel's loop over (source, destination) pairs instead of a contiguous staging area: pair i copies
+// `per` uint4 from pairs[2 i] (a mirror blob in host USM, read with coalesced 16-byte loads) to pairs[2 i + 1] (a ring
+// slot in VRAM). *n_sel pairs, written by mirror_prefetch_select_kernel on the same in-order queue just before.
+__dpct_inline__ void mirror_prefetch_copy_kernel(const unsigned long long *__restrict__ pairs,
+                                                 const int32_t *__restrict__ n_sel, long long per) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long total = (long long) *n_sel * per;
+    for (long long i = (long long) item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+         i < total; i += (long long) item_ct1.get_group_range(2) * item_ct1.get_local_range(2)) {
+        const long long k = i / per, off = i - k * per;
+        ((sycl::uint4 *) pairs[2 * k + 1])[off] = ((const sycl::uint4 *) pairs[2 * k])[off];
+    }
+}
+
 __dpct_inline__ void add_streams_broadcast_kernel(const float *__restrict__ h,
                                                   const float *__restrict__ e,
                                                   float *__restrict__ R,
@@ -2087,9 +2101,14 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      const unsigned long long *slot_off, long long blob,
                      int32_t *__restrict__ pl, long long capx, uint32_t *skip,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
-                     volatile uint32_t *plan_err, uint32_t *__restrict__ stats) {
-    // STRATA_MIRROR_STATS: `stats` is this layer's four counters (resident_plan_set_stats) or null: routed entries
-    // served from a VRAM slot, from the host mirror, from neither, and the groups the plan formed
+                     volatile uint32_t *plan_err, uint32_t *__restrict__ stats,
+                     const int32_t *__restrict__ ring_eid, const unsigned long long *__restrict__ ring_base,
+                     int ring_slots) {
+    // STRATA_MIRROR_STATS: `stats` is this layer's kResidentPlanStatWords counters (resident_plan_set_stats) or null:
+    // routed entries served from a VRAM slot, from the host mirror, from neither, the groups the plan formed, the
+    // mirrored entries pointed at a ring slot, and (the prefetch's word) the experts copied into the ring.
+    // T2a: `ring_eid` / `ring_base` are this layer's prefetch ring (resident_plan_set_ring) or null: a mirrored expert
+    // that sits in a ring slot is pointed at the slot (VRAM) instead of the mirror (PCIe); the bytes are the same.
     using stat_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                       sycl::access::address_space::global_space>;
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -2120,6 +2139,18 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             dpct::atomic_fetch_or<sycl::access::address_space::generic_space>(
                 &s_bad, 1);
         if (stats != nullptr) stat_ref(stats[slot >= 0 ? 0 : maddr != 0 ? 1 : 2]).fetch_add(1u);
+        // T2a: the ring check runs after the residency check, so an expert the adaptive tier swapped into VRAM
+        // (res >= 0) is taken from its cache slot whatever the ring says (D8); only a mirrored one is looked up here.
+        // The ring tables were written by mirror_prefetch on this in-order queue one layer earlier, so the S entries
+        // are stable for the whole kernel. At most kMirrorRingMaxSlots compares per thread.
+        if (slot < 0 && maddr != 0 && ring_eid != nullptr) {
+            for (int s2 = 0; s2 < ring_slots; ++s2)
+                if (ring_eid[s2] == eid) {
+                    maddr = ring_base[s2];
+                    if (stats != nullptr) stat_ref(stats[4]).fetch_add(1u);
+                    break;
+                }
+        }
     }
     item_ct1.barrier(sycl::access::fence_space::local_space);
     if (s_bad) {
@@ -2231,6 +2262,96 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                                sycl::memory_scope::device);
             strata::sys_store(skip, ring);
         }
+    }
+}
+// T2a: the prefetch's select step, one work-group of kResidentPlanMax threads, thread i owns predicted entry i
+// (n <= kResidentPlanMax). An entry is wanted when it is the first occurrence of its expert (the dedupe
+// resident_plan_kernel does), the expert is not in VRAM (res < 0), has a mirror blob (mir != 0) and is not already in
+// the ring. Wanted experts take slots in routing order, round-robin from the layer's cursor, skipping slots that hold an
+// expert predicted this round (it would be evicted just before the plan that wants it), at most S - protected of them.
+// Thread 0 does the compaction and the slot walk (n + S iterations over local memory; the parallel part is the
+// O(n^2) dedupe and the ring scans). Writes ring_eid[slot] = eid for the new entries (the evicted expert simply
+// disappears from the table), the (mirror, slot) address pairs the copy kernel reads, n_sel, the advanced cursor, and
+// stats[5] += n_sel when counting. Every table is read before any is written (the barrier between), so the kernel is
+// a function of the tables as they were when it started.
+__dpct_inline__ void
+mirror_prefetch_select_kernel(const int32_t *__restrict__ pred, int n, const int32_t *__restrict__ res,
+                              const unsigned long long *__restrict__ mir, int n_expert, int32_t *__restrict__ ring_eid,
+                              const unsigned long long *__restrict__ ring_base, uint32_t *__restrict__ cursor,
+                              unsigned long long *__restrict__ pairs, int32_t *__restrict__ n_sel, int S,
+                              uint32_t *__restrict__ stats) {
+    using stat_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kResidentPlanMax]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_want = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kResidentPlanMax]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_ring = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kMirrorRingMaxSlots]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_prot = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kMirrorRingMaxSlots]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_sel_eid = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kMirrorRingMaxSlots]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_sel_slot = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kMirrorRingMaxSlots]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_nsel = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = item_ct1.get_local_id(2);
+    int32_t eid = -1;
+    if (tid < n) { eid = pred[tid]; s_ids[tid] = eid; }
+    if (tid < S) s_ring[tid] = ring_eid[tid];
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    int want = 0;
+    if (tid < n && eid >= 0 && eid < n_expert) {
+        bool first = true;
+        for (int j = 0; j < tid; ++j)
+            if (s_ids[j] == eid) first = false;
+        if (first && res[eid] < 0 && mir[eid] != 0) {
+            bool in_ring = false;
+            for (int s = 0; s < S; ++s)
+                if (s_ring[s] == eid) in_ring = true;
+            want = in_ring ? 0 : 1;
+        }
+    }
+    s_want[tid] = want;
+    if (tid < S) {   // a slot whose expert is predicted this round is kept
+        const int32_t held = s_ring[tid];
+        int prot = 0;
+        if (held >= 0)
+            for (int j = 0; j < n; ++j)
+                if (s_ids[j] == held) prot = 1;
+        s_prot[tid] = prot;
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    if (tid == 0) {
+        int nprot = 0;
+        for (int s = 0; s < S; ++s) nprot += s_prot[s];
+        const int room = S - nprot;
+        int c = (int) (*cursor % (uint32_t) S);
+        int nsel = 0;
+        for (int i = 0; i < n && nsel < room; ++i) {
+            if (!s_want[i]) continue;
+            while (s_prot[c]) c = (c + 1 == S) ? 0 : c + 1;   // room > 0 here: some slot is unprotected
+            s_sel_eid[nsel] = s_ids[i];
+            s_sel_slot[nsel] = c;
+            c = (c + 1 == S) ? 0 : c + 1;
+            ++nsel;
+        }
+        *cursor = (uint32_t) c;
+        *n_sel = nsel;
+        s_nsel = nsel;
+        if (stats != nullptr && nsel > 0) stat_ref(stats[5]).fetch_add((uint32_t) nsel);
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (tid < s_nsel) {
+        const int slot = s_sel_slot[tid];
+        const int32_t e = s_sel_eid[tid];
+        ring_eid[slot] = e;
+        pairs[2 * tid] = mir[e];
+        pairs[2 * tid + 1] = ring_base[slot];
     }
 }
 // The same plan in one block of 128 threads (n <= 128): thread i owns entry i. Groups are the distinct experts in
@@ -2369,11 +2490,23 @@ __dpct_inline__ void copy_or_zero_kernel(sycl::float4 *__restrict__ dst,
 namespace {
 const int32_t* g_mirror_res = nullptr;
 const unsigned long long* g_mirror_table = nullptr;
-// STRATA_MIRROR_STATS: the [n_layers][4] counter buffer and the residency table its layers are found from
+// STRATA_MIRROR_STATS: the [n_layers][kResidentPlanStatWords] counter buffer and the residency table its layers are
+// found from
 const int32_t* g_stats_res = nullptr;
 uint32_t* g_stats = nullptr;
 long long g_stats_layers = 0;
 long long g_stats_expert = 0;
+// T2a: the prefetch ring's tables (resident_plan_set_ring) and the residency table its layers are found from
+const int32_t* g_ring_res = nullptr;
+MirrorRing g_ring;
+long long g_ring_layers = 0;
+long long g_ring_expert = 0;
+// the layer a per-layer residency slice belongs to, by the pointer arithmetic the mirror slice uses (-1: unknown)
+long long layer_of(const int32_t* res_layer, const int32_t* res0, long long n_layers, long long n_expert) {
+    if (res_layer == nullptr || res0 == nullptr || n_expert <= 0 || res_layer < res0) return -1;
+    const long long layer = (long long) (res_layer - res0) / n_expert;
+    return layer < n_layers ? layer : -1;
+}
 }
 void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table) {
     g_mirror_res = d_res;
@@ -2385,16 +2518,37 @@ void resident_plan_set_stats(const int32_t* d_res, uint32_t* stats, long long n_
     g_stats_layers = n_layers;
     g_stats_expert = n_expert;
 }
+void resident_plan_set_ring(const int32_t* d_res, const MirrorRing& ring, long long n_layers, long long n_expert) {
+    const bool on = d_res != nullptr && ring.slots > 0 && ring.slots <= kMirrorRingMaxSlots && ring.eid != nullptr &&
+                    ring.base != nullptr && ring.cursor != nullptr && ring.pairs != nullptr && ring.n_sel != nullptr;
+    g_ring_res = on ? d_res : nullptr;
+    g_ring = on ? ring : MirrorRing{};
+    g_ring_layers = on ? n_layers : 0;
+    g_ring_expert = on ? n_expert : 0;
+}
+int mirror_ring_slots() { return g_ring.slots; }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
         mir = g_mirror_table + (res_layer - g_mirror_res);
-    uint32_t* stats = nullptr;   // STRATA_MIRROR_STATS: this layer's four counters (a fixed address, so baked at capture)
-    if (g_stats != nullptr && g_stats_res != nullptr && g_stats_expert > 0 && res_layer >= g_stats_res) {
-        const long long layer = (long long) (res_layer - g_stats_res) / g_stats_expert;
-        if (layer < g_stats_layers) stats = g_stats + layer * 4;
+    uint32_t* stats = nullptr;   // STRATA_MIRROR_STATS: this layer's counters (a fixed address, so baked at capture)
+    if (g_stats != nullptr) {
+        const long long layer = layer_of(res_layer, g_stats_res, g_stats_layers, g_stats_expert);
+        if (layer >= 0) stats = g_stats + layer * kResidentPlanStatWords;
+    }
+    // T2a: this layer's prefetch ring (fixed addresses, baked at capture); none = today's kernel path
+    const int32_t* ring_eid = nullptr;
+    const unsigned long long* ring_base = nullptr;
+    int ring_slots = 0;
+    if (g_ring.slots > 0) {
+        const long long layer = layer_of(res_layer, g_ring_res, g_ring_layers, g_ring_expert);
+        if (layer >= 0) {
+            ring_eid = g_ring.eid + layer * g_ring.slots;
+            ring_base = g_ring.base + layer * g_ring.slots;
+            ring_slots = g_ring.slots;
+        }
     }
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -2409,10 +2563,69 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                     [[sycl::reqd_sub_group_size(32)]] {
                         resident_plan_kernel(
                             ids, n_entries, k, res_layer, n_expert, cache_base,
-                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, stats);
+                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, stats,
+                            ring_eid, ring_base, ring_slots);
                     });
     }
     check("resident_plan");
+}
+void mirror_prefetch_tables(const int32_t* pred_ids, int n, const int32_t* res, const unsigned long long* mir,
+                            int n_expert, int32_t* ring_eid, const unsigned long long* ring_base, uint32_t* cursor,
+                            unsigned long long* pairs, int32_t* n_sel, int slots, long long blob_bytes, uint32_t* stats,
+                            void* stream) {
+    if (n <= 0 || slots <= 0) return;
+    if (n > kResidentPlanMax || slots > kMirrorRingMaxSlots) {
+        std::fprintf(stderr, "mirror_prefetch: %d predicted entries (at most %d) or %d slots (at most %d)\n", n,
+                     kResidentPlanMax, slots, kMirrorRingMaxSlots);
+        std::exit(1);
+    }
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "mirror_prefetch: blob size must be a multiple of 16\n"); std::exit(1); }
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class mirror_prefetch_select_kernel_7a2c41>>(
+                sycl::nd_range<3>(sycl::range(1, 1, kResidentPlanMax),
+                                  sycl::range(1, 1, kResidentPlanMax)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1)
+                    [[sycl::reqd_sub_group_size(32)]] {
+                        mirror_prefetch_select_kernel(pred_ids, n, res, mir, n_expert, ring_eid, ring_base, cursor,
+                                                      pairs, n_sel, slots, stats);
+                    });
+    }
+    check("mirror_prefetch_select");
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        const long long per = blob_bytes / 16;
+
+        strata::q_of(stream)
+            ->parallel_for<dpct_kernel_name<class mirror_prefetch_copy_kernel_9d1e58>>(
+                sycl::nd_range<3>(sycl::range(1, 1, 48 * 8) * sycl::range(1, 1, 256),
+                                  sycl::range(1, 1, 256)),
+                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                    mirror_prefetch_copy_kernel(pairs, n_sel, per);
+                });
+    }
+    check("mirror_prefetch_copy");
+}
+void mirror_prefetch(const int32_t* pred_ids, int n, const int32_t* res_layer, int n_expert, long long blob_bytes,
+                     void* stream) {
+    if (g_ring.slots <= 0 || g_mirror_table == nullptr || g_mirror_res == nullptr || res_layer < g_mirror_res) return;
+    const long long layer = layer_of(res_layer, g_ring_res, g_ring_layers, g_ring_expert);
+    if (layer < 0) return;
+    const unsigned long long* mir = g_mirror_table + (res_layer - g_mirror_res);
+    uint32_t* stats = nullptr;
+    if (g_stats != nullptr) {
+        const long long sl = layer_of(res_layer, g_stats_res, g_stats_layers, g_stats_expert);
+        if (sl >= 0) stats = g_stats + sl * kResidentPlanStatWords;
+    }
+    const int S = g_ring.slots;
+    mirror_prefetch_tables(pred_ids, n, res_layer, mir, n_expert, g_ring.eid + layer * S, g_ring.base + layer * S,
+                           g_ring.cursor + layer, g_ring.pairs + layer * 2 * S, g_ring.n_sel + layer, S, blob_bytes,
+                           stats, stream);
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(*strata::q_of(stream));

@@ -43,6 +43,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -117,6 +118,22 @@ bool sh_stream_on() {
 #endif
     }();
     return on;
+}
+
+// T2a, STRATA_PF_SLOTS=S (default 0 = off): the verifier predicts layer l + 1's routed experts from layer l's MoE
+// input inside the window and the prefetch copies the predicted mirror misses into a per-layer VRAM slot ring one
+// layer ahead (generate.cpp allocates the ring and registers it with resident_plan_set_ring before capture). The
+// verifier reads the switch only to carve the prediction scratch; the capture asks mirror_ring_slots() whether a ring
+// was in fact registered. STRATA_PF_QUEUE=main|side names the queue the prediction and copy run on: this branch is the
+// measurement gate and runs the main in-order queue only (everything serialised, correct by construction); `side`
+// is accepted, announced, and falls back to main.
+int pf_slots_env() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_PF_SLOTS");
+        const int s = v ? std::atoi(v) : 0;
+        return s < 0 ? 0 : s;
+    }();
+    return n;
 }
 
 // A one-token window always keeps its token, so its graph advances the sequence state itself (the GDN conv history
@@ -540,6 +557,10 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        if (pf_slots_env() > 0) {   // T2a: the next layer's routing of this layer's input (off: nothing allocated)
+            pred_logits_ = b.take<float>(T * (uint64_t) g.n_expert); pred_w_ = b.take<float>(T * K);
+            pred_ids_ = b.take<int32_t>(T * K);
+        }
     };
     Bump count;
     carve(count);
@@ -709,6 +730,19 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
+    if (pf_slots_env() > 0) {   // T2a: what the windows will capture
+        const int ring_s = strata::kernels::mirror_ring_slots();
+        const char* qv = std::getenv("STRATA_PF_QUEUE");
+        const bool side = qv != nullptr && std::strcmp(qv, "side") == 0;
+        if (ring_s > 0 && device_plan_)
+            std::fprintf(stderr, "strata verify: mirror prefetch on: layer l + 1's router on layer l's MoE input, its mirrored "
+                                 "experts copied into a %d-slot ring per layer on the %s queue%s (STRATA_PF_SLOTS)\n",
+                         ring_s, "main", side ? " (STRATA_PF_QUEUE=side is not built in this branch: main)" : "");
+        else
+            std::fprintf(stderr, "strata verify: STRATA_PF_SLOTS=%d but %s: no prefetch is captured\n", pf_slots_env(),
+                         ring_s <= 0 ? "no prefetch ring was registered (no mirror, or its allocation failed)"
+                                     : "the device plan is off (STRATA_VERIFY_DEVICE_PLAN=1 is needed, and not all resident)");
+    }
     return true;
 }
 catch (sycl::exception const &exc) {
@@ -1296,6 +1330,47 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 dpct::sync_barrier(ev_fork_, cs);
                 (sh_cs_)->ext_oneapi_submit_barrier({*ev_fork_});
             }
+        }
+        // T2a (STRATA_PF_SLOTS): predict layer l + 1's routed experts by running ITS router (ffn_gate_inp of l + 1) on
+        // THIS layer's MoE input, the same prediction upstream's host RouterLookahead makes, then copy the predicted
+        // mirror misses into layer l + 1's ring. Only with the device plan (the mirror path; all-resident stages have
+        // nothing to prefetch) and a registered ring; the last layer of the stage predicts nothing. Everything is on
+        // the main in-order queue `cs`, right after this layer's plan and before its expert kernels: the copy's time is
+        // on the critical path (the measurement gate), and the ordering is by construction:
+        //  - layer l + 1's ring is written here and read by pre(l + 1)'s resident_plan and post(l + 1)'s expert kernels,
+        //    both later on `cs`; the next window's write of that ring (its pre(l)) follows this window's post(l + 1)
+        //    on the same queue (graph launches on `cs` serialise), so a slot is never refilled under a reader;
+        //  - G == 2 (split window): both groups prefetch, each with its own predicted ids into the one ring of layer
+        //    l + 1 (full S each, not S per group: the second group's select protects slots that hold experts it
+        //    predicts and refills the rest round-robin, so with few misses the two groups' sets coexist and with many
+        //    the ring turns over; the groups route different tokens, so a split ring would halve each one's reach).
+        //    Both groups' prefetches (pre(l, 0), pre(l, 1)) precede both plans of l + 1 (pre(l + 1, 0), pre(l + 1, 1))
+        //    on `cs`, and nothing writes the ring between a plan and its expert kernels, so an eviction by group 1 can
+        //    only cost group 0 a hit, never a wrong pointer.
+        // The prediction uses the same launches as the real routing above (the fused multi-token router when that
+        // path is taken, else moe_route per token), so a wrong guess only costs bandwidth: resident_plan still checks
+        // res, then the ring, then the mirror, and the expert kernels read the same bytes from either address.
+        if (device_plan_ && pred_logits_ != nullptr && l + 1 < le_ && strata::kernels::mirror_ring_slots() > 0) {
+            const int64_t l1 = l + 1;
+            const LayerView v1(wt, l1);
+            const WeightRef* w_router1 = v1.get("ffn_gate_inp.weight");
+            if (w_router1 == nullptr) { err = v1.name("ffn_gate_inp.weight") + " is missing"; return false; }
+            try {
+                if (dec_batch && n > 1 && native_router_enabled() && (NE == 512 || NE == 256) && K == 10) {
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router1->data, pred_logits_ + tb * NE,
+                                              NE, N, NE, n, cs);
+                    native_router_top10_multi_ne(pred_logits_ + tb * NE, pred_ids_ + tb * K, pred_w_ + tb * K, n, (int) NE, cs);
+                } else {
+                    for (int t = tb; t < te; ++t) {
+                        MoEBuffers mb = ss.moe;
+                        mb.logits = pred_logits_ + t * NE; mb.ids = pred_ids_ + t * K; mb.weights = pred_w_ + t * K;
+                        if (!moe_route(wt, g, l1, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+                    }
+                }
+            } catch (const std::exception& e) { err = "verify prefetch router: " + std::string(e.what()); return false; }
+            strata::kernels::mirror_prefetch(pred_ids_ + tb * K, n * (int) K, hits_.d_res + l1 * g.n_expert,
+                                             (int) g.n_expert,
+                                             (long long) strata::kernels::cpu::expert_layout().blob_bytes(l1), cs);
         }
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made

@@ -4204,6 +4204,73 @@ int main(int argc, char **argv) try {
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
+    // T2a, STRATA_PF_SLOTS=S (default 0 = off, nothing allocated): a ring of S VRAM slots per layer that the verify
+    // window fills one layer ahead with the mirror misses layer l + 1's router predicts on layer l's input, so the
+    // expert kernels read those blobs from VRAM instead of over PCIe (resident_plan_mirror.hpp). It is extra VRAM
+    // outside the expert cache, allocated HERE, BEFORE the cache auto-sizing below reads the free figure: the sizing
+    // then sees that much less and the "MiB of VRAM free with everything loaded" line (serve) stays what it means. It
+    // exists only where a mirror can: --stream-experts from the GGUF with a cache; it is registered once the mirror
+    // table is built (resident_plan_set_ring, next to resident_plan_set_mirror) and freed if no expert ended up
+    // mirrored. Slot stride: the layout's largest blob rounded up to 256 (the copy kernel's 16-byte loads, the mirror's
+    // own 256-byte rounding). Every layer's blob size must be a multiple of 16, else the ring is refused.
+    strata::kernels::MirrorRing pf_ring;
+    uint8_t* pf_ring_mem = nullptr;
+    const int pf_slots = [] { const char* v = std::getenv("STRATA_PF_SLOTS"); const int n = v ? std::atoi(v) : 0; return n < 0 ? 0 : n; }();
+    if (pf_slots > 0 && o.stream_experts && srcp == &gguf_src && o.expert_cache != 0) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        bool ok = pf_slots <= strata::kernels::kMirrorRingMaxSlots;
+        if (!ok)
+            std::fprintf(stderr, "strata generate: STRATA_PF_SLOTS=%d is more than the %d slots a layer the plan kernel scans: no ring\n",
+                         pf_slots, strata::kernels::kMirrorRingMaxSlots);
+        for (int64_t l = 0; ok && l < g.n_layers; ++l)
+            if (lay.blob_bytes(l) % 16 != 0) {
+                std::fprintf(stderr, "strata generate: layer %lld's expert blob (%llu bytes) is not a multiple of 16: no prefetch ring\n",
+                             (long long) l, (unsigned long long) lay.blob_bytes(l));
+                ok = false;
+            }
+        if (ok) {
+            const uint64_t stride = (lay.max_blob + 255) & ~(uint64_t) 255;
+            const size_t ring_bytes = (size_t) g.n_layers * (size_t) pf_slots * (size_t) stride;
+            const size_t n_ent = (size_t) g.n_layers * (size_t) pf_slots;
+            auto& q = dpct::get_in_order_queue();
+            pf_ring_mem = (uint8_t*) strata::malloc_device_guarded(ring_bytes, q, "mirror prefetch ring");
+            if (pf_ring_mem == nullptr) {
+                std::fprintf(stderr, "strata generate: the %zu MiB mirror prefetch ring (STRATA_PF_SLOTS=%d) does not fit: no ring\n",
+                             ring_bytes >> 20, pf_slots);
+            } else {
+                pf_ring.slots = pf_slots;
+                pf_ring.eid = sycl::malloc_device<int32_t>(n_ent, q);
+                pf_ring.base = sycl::malloc_device<unsigned long long>(n_ent, q);
+                pf_ring.cursor = sycl::malloc_device<uint32_t>((size_t) g.n_layers, q);
+                pf_ring.pairs = sycl::malloc_device<unsigned long long>(2 * n_ent, q);
+                pf_ring.n_sel = sycl::malloc_device<int32_t>((size_t) g.n_layers, q);
+                if (pf_ring.eid == nullptr || pf_ring.base == nullptr || pf_ring.cursor == nullptr || pf_ring.pairs == nullptr ||
+                    pf_ring.n_sel == nullptr) {
+                    std::fprintf(stderr, "strata generate: the mirror prefetch ring's tables do not fit: no ring\n");
+                    for (void* ptr : {(void*) pf_ring.eid, (void*) pf_ring.base, (void*) pf_ring.cursor, (void*) pf_ring.pairs,
+                                      (void*) pf_ring.n_sel, (void*) pf_ring_mem})
+                        if (ptr != nullptr) sycl::free(ptr, q);
+                    pf_ring = strata::kernels::MirrorRing{};
+                    pf_ring_mem = nullptr;
+                } else {
+                    std::vector<int32_t> eid(n_ent, -1);
+                    std::vector<unsigned long long> base(n_ent);
+                    for (size_t i = 0; i < n_ent; ++i) base[i] = (unsigned long long) (pf_ring_mem + i * stride);
+                    q.memcpy(pf_ring.eid, eid.data(), n_ent * sizeof(int32_t)).wait();
+                    q.memcpy(pf_ring.base, base.data(), n_ent * sizeof(unsigned long long)).wait();
+                    q.memset(pf_ring.cursor, 0, (size_t) g.n_layers * sizeof(uint32_t)).wait();
+                    q.memset(pf_ring.pairs, 0, 2 * n_ent * sizeof(unsigned long long)).wait();
+                    q.memset(pf_ring.n_sel, 0, (size_t) g.n_layers * sizeof(int32_t)).wait();
+                    std::fprintf(stderr, "strata generate: mirror prefetch ring: %d slots x %lld layers x %llu bytes = %zu MiB of VRAM, "
+                                         "outside the expert cache (STRATA_PF_SLOTS; the cache sizing below sees it as taken)\n",
+                                 pf_slots, (long long) g.n_layers, (unsigned long long) stride, ring_bytes >> 20);
+                }
+            }
+        }
+    } else if (pf_slots > 0) {
+        std::fprintf(stderr, "strata generate: STRATA_PF_SLOTS=%d needs --stream-experts from the GGUF with an expert cache (the "
+                             "only run with a host mirror): no ring\n", pf_slots);
+    }
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
@@ -4803,15 +4870,26 @@ int main(int argc, char **argv) try {
             if (!keep) o.adapt_every = 0;
         }
     }
+    if (pf_ring.slots > 0 && mirror_table_d == nullptr) {   // T2a: nothing is mirrored, so nothing to prefetch
+        std::fprintf(stderr, "strata generate: no expert is mirrored: the mirror prefetch ring is freed (STRATA_PF_SLOTS)\n");
+        auto& q = dpct::get_in_order_queue();
+        for (void* ptr : {(void*) pf_ring.eid, (void*) pf_ring.base, (void*) pf_ring.cursor, (void*) pf_ring.pairs,
+                          (void*) pf_ring.n_sel, (void*) pf_ring_mem})
+            if (ptr != nullptr) sycl::free(ptr, q);
+        pf_ring = strata::kernels::MirrorRing{};
+        pf_ring_mem = nullptr;
+    }
     // STRATA_MIRROR_STATS=1: the device-built verify plan (resident_plan) counts per layer, in a device buffer of
-    // [n_layers][4] uint32, the routed entries it served from a VRAM slot, from the pinned host mirror (read over
-    // PCIe) and from neither (the error case), plus the groups it formed. The host-side counters (multi_misses,
-    // cache_hits, pcie_experts) belong to the CPU pool path the device plan bypasses, so they say nothing about the
-    // mirror. Read back and zeroed after each request, one summary line per request; =2 adds every layer. Off: no
-    // buffer, no kernel code.
+    // [n_layers][kResidentPlanStatWords] uint32, the routed entries it served from a VRAM slot, from the pinned host
+    // mirror (read over PCIe) and from neither (the error case), plus the groups it formed, and (T2a, with a prefetch
+    // ring) the mirrored entries it pointed at a ring slot and the experts the prefetch copied. The host-side counters
+    // (multi_misses, cache_hits, pcie_experts) belong to the CPU pool path the device plan bypasses, so they say
+    // nothing about the mirror. Read back and zeroed after each request, one summary line per request; =2 adds every
+    // layer. Off: no buffer, no kernel code.
     const int mirror_stats = [] { const char* v = std::getenv("STRATA_MIRROR_STATS"); return v ? std::atoi(v) : 0; }();
-    uint32_t* mirror_stats_d = nullptr;   // [n_layers][4]: VRAM, mirror, neither, groups (lives as long as the process)
-    const size_t mirror_stats_n = (size_t) g.n_layers * 4;
+    constexpr int kSW = strata::kernels::kResidentPlanStatWords;
+    uint32_t* mirror_stats_d = nullptr;   // [n_layers][kSW]: VRAM, mirror, neither, groups, ring hits, ring copies (process lifetime)
+    const size_t mirror_stats_n = (size_t) g.n_layers * kSW;
     if (mirror_stats > 0) {
         mirror_stats_d = sycl::malloc_device<uint32_t>(mirror_stats_n, dpct::get_in_order_queue());
         if (mirror_stats_d == nullptr) {
@@ -4829,16 +4907,16 @@ int main(int argc, char **argv) try {
         std::vector<uint32_t> h(mirror_stats_n, 0u);
         q->memcpy(h.data(), mirror_stats_d, mirror_stats_n * sizeof(uint32_t)).wait();
         q->memset(mirror_stats_d, 0, mirror_stats_n * sizeof(uint32_t)).wait();
-        unsigned long long vram = 0, mirror = 0, neither = 0, groups = 0;
+        unsigned long long vram = 0, mirror = 0, neither = 0, groups = 0, ring_hits = 0, ring_copies = 0;
         int64_t layers_seen = 0;
         std::vector<int> order;
         for (int64_t l = 0; l < g.n_layers; ++l) {
-            const uint32_t* c = h.data() + (size_t) l * 4;
-            vram += c[0]; mirror += c[1]; neither += c[2]; groups += c[3];
+            const uint32_t* c = h.data() + (size_t) l * kSW;
+            vram += c[0]; mirror += c[1]; neither += c[2]; groups += c[3]; ring_hits += c[4]; ring_copies += c[5];
             if (c[0] + c[1] + c[2] > 0) { ++layers_seen; order.push_back((int) l); }
         }
         auto share = [&](int l) {   // the layer's mirror share of its routed entries
-            const uint32_t* c = h.data() + (size_t) l * 4;
+            const uint32_t* c = h.data() + (size_t) l * kSW;
             const double tot = (double) c[0] + (double) c[1] + (double) c[2];
             return tot > 0 ? (double) c[1] / tot : 0.0;
         };
@@ -4849,20 +4927,30 @@ int main(int argc, char **argv) try {
         if (!order.empty()) {
             off += std::snprintf(buf + off, sizeof buf - (size_t) off, "; worst layers by mirror share:");
             for (size_t i = 0; i < order.size() && i < 3; ++i) {
-                const uint32_t* c = h.data() + (size_t) order[i] * 4;
+                const uint32_t* c = h.data() + (size_t) order[i] * kSW;
                 off += std::snprintf(buf + off, sizeof buf - (size_t) off, " L%d %.1f%% (%u/%u)", order[i],
                                      100.0 * share(order[i]), c[1], c[0] + c[1] + c[2]);
             }
         }
         const double per_win = windows > 0 && layers_seen > 0 ? (double) groups / ((double) windows * (double) layers_seen) : 0.0;
-        std::snprintf(buf + off, sizeof buf - (size_t) off, "; %.2f groups per window per layer (%lld layers planned)",
-                      per_win, (long long) layers_seen);
+        off += std::snprintf(buf + off, sizeof buf - (size_t) off, "; %.2f groups per window per layer (%lld layers planned)",
+                             per_win, (long long) layers_seen);
+        // T2a: with a prefetch ring, how many of the mirrored entries the plan pointed at a ring slot (VRAM) and how
+        // many experts the prefetch copied for it (hits / copies is the prediction's yield); the line is D7's without it
+        const bool ring_on = strata::kernels::mirror_ring_slots() > 0;
+        if (ring_on && off < (int) sizeof buf)
+            std::snprintf(buf + off, sizeof buf - (size_t) off, "; ring hits %llu of %llu mirrored entries (%.1f%%), copies %llu",
+                          ring_hits, mirror, mirror > 0 ? 100.0 * (double) ring_hits / (double) mirror : 0.0, ring_copies);
         if (mirror_stats >= 2) {
             for (int64_t l = 0; l < g.n_layers; ++l) {
-                const uint32_t* c = h.data() + (size_t) l * 4;
-                char lb[96];
-                std::snprintf(lb, sizeof lb, "%sL%lld %u/%u/%u/%.1f", l > 0 ? " " : "", (long long) l, c[0], c[1], c[2],
-                              windows > 0 ? (double) c[3] / (double) windows : (double) c[3]);
+                const uint32_t* c = h.data() + (size_t) l * kSW;
+                char lb[128];
+                if (ring_on)
+                    std::snprintf(lb, sizeof lb, "%sL%lld %u/%u/%u/%.1f/r%u/c%u", l > 0 ? " " : "", (long long) l, c[0], c[1], c[2],
+                                  windows > 0 ? (double) c[3] / (double) windows : (double) c[3], c[4], c[5]);
+                else
+                    std::snprintf(lb, sizeof lb, "%sL%lld %u/%u/%u/%.1f", l > 0 ? " " : "", (long long) l, c[0], c[1], c[2],
+                                  windows > 0 ? (double) c[3] / (double) windows : (double) c[3]);
                 per_layer += lb;
             }
         }
@@ -6977,6 +7065,8 @@ int main(int argc, char **argv) try {
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
         if (mirror_stats_d != nullptr && thits.d_res != nullptr)   // STRATA_MIRROR_STATS: before the windows are captured
             strata::kernels::resident_plan_set_stats(thits.d_res, mirror_stats_d, (long long) g.n_layers, (long long) g.n_expert);
+        if (mirror_table_d != nullptr && pf_ring.slots > 0 && thits.d_res != nullptr)   // T2a: before the windows are captured
+            strata::kernels::resident_plan_set_ring(thits.d_res, pf_ring, (long long) g.n_layers, (long long) g.n_expert);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -12091,6 +12181,8 @@ int main(int argc, char **argv) try {
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
         if (mirror_stats_d != nullptr && thits.d_res != nullptr)   // STRATA_MIRROR_STATS: before the windows are captured
             strata::kernels::resident_plan_set_stats(thits.d_res, mirror_stats_d, (long long) g.n_layers, (long long) g.n_expert);
+        if (mirror_table_d != nullptr && pf_ring.slots > 0 && thits.d_res != nullptr)   // T2a: before the windows are captured
+            strata::kernels::resident_plan_set_ring(thits.d_res, pf_ring, (long long) g.n_layers, (long long) g.n_expert);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

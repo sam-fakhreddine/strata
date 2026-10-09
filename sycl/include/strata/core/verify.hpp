@@ -448,6 +448,9 @@ private:
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
+    // T2a (STRATA_PF_SLOTS): the next layer's router run on this layer's MoE input, into scratch the prefetch reads
+    float *pred_logits_ = nullptr, *pred_w_ = nullptr;            // T * n_expert, T * k (the weights are unused)
+    int32_t* pred_ids_ = nullptr;                                 // T * k predicted experts of layer l + 1
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
