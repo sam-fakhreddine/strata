@@ -4740,6 +4740,48 @@ int main(int argc, char **argv) try {
                                  "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
             return 2;
         }
+        // The adaptive tier (--adapt-every N, --adapt-swaps M; on by default: 4 and 96) beside this mirror.  Read on
+        // 2026-10-09 against this file, core/verify.cpp, core/expert_source.cpp and kernels/cuda/verify_kernels.dp.cpp:
+        //  - the tier is ARMED under --stream-experts: `drive.d.usage` is sized whenever adapt_every > 0 and
+        //    adapt_swaps > 0 and some expert has no slot (serve: all_experts_resident; generate: unconditionally), and
+        //    the blocking adapt() lambda of each loop runs every adapt_every windows with no check of the source type.
+        //    Its swap-in reads `srcp->blob()` (a GGUF read into the ring) and its eviction sets `host_res[out]` to
+        //    kNotResident, which apply_pending() / res_upload() copy to d_res.  resident_stage_swaps() is a no-op here
+        //    (src.complement_ready() is false: there is no resident RAM copy), and the asynchronous tier
+        //    (--adapt-async) is not live at all: it needs the resident RAM mode.
+        //  - but its routing counts are filled only by the host pool: expert_pool_dispatch_multi (expert_source.cpp,
+        //    `d.usage[...] += 1.0f`) is reached only through the pool callback of the Verifier's host service loop
+        //    (verify.cpp, `for (k = 0; !no_host && k < steps; ++k)` ... `pool(user, ...)`).  With STRATA_VERIFY_NO_HOST=1
+        //    (the port's wrapper default) that loop never runs, every count stays 0, adapt() finds no candidate
+        //    (u[e] >= 2.0f) and swaps nothing - which is why the device-plan soaks with the default --adapt-every 4
+        //    were deterministic and did not hang.  With STRATA_VERIFY_NO_HOST=0 the host serves every group (the pool
+        //    is called whether or not the device planned it), the counts fill, and the tier does swap.
+        //  - nothing updates the mirror on an eviction: the mirror is built once, above, from the experts that had no
+        //    slot at start; GgufExpertSource::mirror() frees and rebuilds the whole region, so it cannot be re-run
+        //    while the device plan reads it, and `tab` is uploaded once and never touched again.  An expert that
+        //    started in VRAM and is evicted therefore has slot < 0 AND mir[e] == 0: resident_plan_kernel sets s_bad
+        //    and skips the group (*skip = 0).  With the host service on, the host plans that group from the GGUF
+        //    (correct, slow); with STRATA_VERIFY_NO_HOST=1 no host plan would replace it and the GPU would wait for a
+        //    plan that never comes (verify.cpp, the no_host comment) - latent today only because of the zero counts.
+        //    A swapped-in expert keeps its now redundant mirror entry (the kernel checks the slot first), so a later
+        //    re-eviction of that one is fine.
+        //  - writing an address back on eviction cannot fix this: the evicted expert has no mirror blob to point at,
+        //    and giving it one needs a GGUF read plus pinned memory the fixed region has no room for.  So the tier is
+        //    turned off for this run (o.adapt_every = 0: every consumer of it is below this point, and each modulo on
+        //    it is guarded by `!drive.d.usage.empty()`).  STRATA_ADAPT_WITH_MIRROR=1 keeps it on, for the test that
+        //    shows the hazard.
+        if (mirror_table_d != nullptr && o.adapt_every > 0 && o.adapt_swaps > 0 &&
+            [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }()) {
+            const char* w = std::getenv("STRATA_ADAPT_WITH_MIRROR");
+            const bool keep = w != nullptr && *w && std::strcmp(w, "0") != 0;
+            std::fprintf(stderr, "strata generate: WARNING: --adapt-every %d with --stream-experts and a host mirror under "
+                                 "STRATA_VERIFY_DEVICE_PLAN: an expert the adaptive tier evicts from VRAM never reaches the "
+                                 "mirror table, so the device plan would find it in neither the cache nor the mirror; %s\n",
+                         o.adapt_every,
+                         keep ? "STRATA_ADAPT_WITH_MIRROR is set, so the tier stays on (testing only)"
+                              : "the adaptive tier is off for this run (STRATA_ADAPT_WITH_MIRROR=1 keeps it on)");
+            if (!keep) o.adapt_every = 0;
+        }
     }
 
     for (auto& stp : stages) {
