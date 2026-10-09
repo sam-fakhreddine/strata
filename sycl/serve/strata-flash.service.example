@@ -1,0 +1,43 @@
+# strata-flash.service: Strata's SYCL engine serving Qwen3.8-Flash-Next on the Arc Pro B70, natively (no Docker),
+# through sycl/serve/server_intel.py with sycl/serve/strata-native.sh as the engine's `exe`. An example for an Ubuntu
+# VM where the card is shared with other model servers: copy it to /etc/systemd/system/strata-flash.service, replace
+# /opt/llm/strata/Strata with the checkout's path, then `systemctl daemon-reload` and `systemctl enable --now strata-flash`.
+# The serve config it loads is sycl/serve/strata-flash.json.example (copied to <repo>/strata-flash.json).
+[Unit]
+Description=Strata (SYCL) Qwen3.8-Flash-Next IQ2_XS on the Arc Pro B70, OpenAI API on 127.0.0.1:8097
+After=network-online.target b70-power-cap.service
+Wants=network-online.target b70-power-cap.service
+# every unit that can own the B70: one model on the card at a time (shieldgemma stays here until it has its own card)
+Conflicts=qwen38.service cyber-llm.service llama-swap.service llama-server.service llama-gemma.service shieldgemma.service
+RequiresMountsFor=/opt/llm
+
+[Service]
+User=ubuntu
+# the GPU: /dev/dri/renderD* is group render on Ubuntu; without it sycl-ls shows only the CPU device
+SupplementaryGroups=render
+# the pinned RAM mirror of the experts that do not fit in VRAM, and the stage buffers, are locked memory
+LimitMEMLOCK=infinity
+# first to go when the VM runs out of RAM (strata-native.sh sets the same on the engine process)
+OOMScoreAdjust=1000
+# STRATA_API_KEY=<key>, 0600 root; serve/server.py reads the variable itself (its --api-key defaults to $STRATA_API_KEY)
+EnvironmentFile=-/etc/homelab/secrets/strata.env
+# the Arc, not the NVIDIA card in the same VM (strata-native.sh would default to this too; here it is explicit)
+Environment=ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+# STRATA_MIRROR_MIB: the size of the pinned RAM mirror. Unset, the engine takes MemAvailable minus 4 GiB once at
+# start, so a co-tenant that starts later gets squeezed: set it explicitly on a shared VM (IQ2_XS needs about 8.4 GiB).
+#Environment=STRATA_MIRROR_MIB=9216
+# Fail closed unless the B70's power cap reads 180 W. Wants= alone does not prove b70-power-cap.service succeeded.
+# The card is the drm device whose vendor is 0x8086; the cap is hwmon's power1_cap in microwatts. Confirm the path
+# against /usr/local/sbin/b70-power-cap.sh on the VM (the xe driver may put the cap on a tile's hwmon instead).
+# systemd expands $ and % itself, hence the doubled $$ and %% below.
+ExecStartPre=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ "$$(cat $$d/vendor 2>/dev/null)" = 0x8086 ] || continue; for f in $$d/hwmon/hwmon*/power1_cap; do [ -r "$$f" ] && [ "$$(cat $$f)" = 180000000 ] && exit 0; done; done; echo "strata-flash: the B70 power cap is not 180 W, refusing to start" >&2; exit 1'
+WorkingDirectory=/opt/llm/strata/Strata
+# setup.sh's own .venv (serve/server.py needs its packages); the API key comes from the environment, no flag needed
+ExecStart=/opt/llm/strata/Strata/.venv/bin/python /opt/llm/strata/Strata/sycl/serve/server_intel.py --engine strata --config /opt/llm/strata/Strata/strata-flash.json --host 127.0.0.1 --port 8097
+# startup: ~45 s (AOT build) to ~90 s (JIT) plus the mirror fill
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
