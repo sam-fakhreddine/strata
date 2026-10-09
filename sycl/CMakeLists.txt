@@ -256,6 +256,13 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(${p}_parity PRIVATE strata_kernels)
     add_test(NAME ${p}_parity COMMAND ${p}_parity)
   endforeach()
+  # the prompt path's hyper-connection read with STRATA_GR_FUSE_READ=1 (gr_mix_x16: the mix over the BF16 image) against
+  # the default gr_norm_rs + gr_mix_r pair: synthetic prompt shape, inside the BF16 rounding bound, the images bitwise
+  # (strata_prefill: the kernels live in src/prefill/kernels.cu)
+  strata_resolve(_src src/kernels/gr_prompt_read_parity.cpp)
+  add_executable(gr_prompt_read_parity ${_src})
+  target_link_libraries(gr_prompt_read_parity PRIVATE strata_kernels strata_prefill)
+  add_test(NAME gr_prompt_read_parity COMMAND gr_prompt_read_parity)
   # not built here: qsa_topk_parity / qsa_topk_active_parity (the sm_90 thread-block-cluster QSA top-k has no SYCL
   # counterpart: the callers take the plain kernels), route_window_parity and fused_gr_bench (no migrated copy yet)
   # (upstream PR #413's gdn_rec_parity is an SM-holding NVIDIA bench - PTX timers, __nanosleep - not built here; the

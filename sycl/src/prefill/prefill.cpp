@@ -36,6 +36,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/gr_fuse_read.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -297,6 +298,14 @@ constexpr int64_t ZV_PAD = 64;
 // F-1: STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm
 inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
+    return v;
+}
+// STRATA_GR_FUSE_READ=1 (this port, on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the hyper-connection read's mix
+// over the BF16 image gr_norm_rs wrote (gr_mix_x16) instead of a second FP32 pass over R (gr_mix_r).  Half the bytes
+// of that pass; rounding-level (x with BF16's 8 mantissa bits): quality-gated, like STRATA_PF_HCDOWN.  Not taken when
+// the image has a low part (STRATA_PREFILL_BF16X2=1: hi + lo is as many bytes as R) or with STRATA_GR_UNFUSED=1.
+inline bool gr_fuse_read() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_GR_FUSE_READ"); return e && e[0] == '1'; }();
     return v;
 }
 
@@ -2872,6 +2881,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                } else if (gr_fuse_read() && !m.xn16_lo && T >= pf_switch_min_t()) {
+                    // STRATA_GR_FUSE_READ: the mix reads the BF16 image (token stride ldx) this half's norm wrote, not R
+                    gr_mix_x16(m.xn16, ldx, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);

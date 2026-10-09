@@ -780,6 +780,8 @@ buffers take ~700 cache slots; `--prefill 8192 --prefill-borrow` lends cache slo
 at ~1 s of refill per prompt). Where the 4K prompt's GPU time goes now (GPU timeline, timing on): expert dequant 20%, the two
 expert GEMMs 34%, QSA attention 14%, host grouping 6.5%, GDN 9%, hyper-connection reads 4.6%.
 
+`STRATA_GR_FUSE_READ=1` (opt-in, on chunks of `STRATA_PF_SWITCH_MIN_T`+ tokens): the hyper-connection read's mix takes x = R * rs * w from the BF16 image the norm already wrote for the GEMMs (`gr_mix_x16`) instead of a second FP32 pass over the 168 MB residual of a 4K chunk, half the bytes of that pass (about 2% of the prompt's GPU time if the reads are bandwidth-bound; to be measured). Rounding-level, not bit-identical (x with 8 mantissa bits, as the down and inject projections see it; a bitwise form would carry FP32 x and is `STRATA_GR_UNFUSED=1`, which moves more bytes, not fewer): quality-gated like `STRATA_PF_HCDOWN`; `gr_prompt_read_parity` checks it against the default pair; not taken with `STRATA_PREFILL_BF16X2=1`.
+
 **Draft length** (200 tokens, medians of 5 interleaved pairs, `--spec-min-p 0.5`): `--spec 6` against `--spec 4` is +6.5% on
 code (43.4 against 40.8 tok/s, 84% accepted against 90%) and -1.5% on prose (29.9 against 30.4). A 2-run sweep of the rest
 (`--spec 2/3/5`, min-p 0.3/0.7) was within the run-to-run noise of ~1 tok/s; the setup default (4, 0.5) stays.
