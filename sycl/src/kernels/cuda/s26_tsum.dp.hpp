@@ -7,7 +7,9 @@
 // DPP row_xmask / permlanex16 instead of ds_bpermute.
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
    // (before the first use of __forceinline__ / __float_as_int: a gfx906 build

@@ -36,6 +36,16 @@ set(STRATA_SYCL_SPIN_MAX "" CACHE STRING "fixed bound of the device's spins on h
 if(STRATA_SYCL_SPIN_MAX)
   add_compile_definitions(STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
 endif()
+# Every migrated file defines DPCT_PROFILING_ENABLED (guarded on this macro, tools/fixups.py), which makes dpct create
+# every queue with enable_profiling and record events as real barriers. OFF is an unmeasured A/B candidate for the
+# decode round: the Level Zero adapter can then use cheaper events, and the stage profiler, STRATA_DECODE_TIMING and
+# STRATA_PREFILL_TIMING report zeros (include/strata/sycl_queue.hpp, prof_ns).
+option(STRATA_SYCL_PROFILING_QUEUES
+       "create every SYCL queue with enable_profiling, as dpct does; OFF drops the property so the Level Zero adapter can use cheaper events; the stage profiler and timing switches then report zeros"
+       ON)
+if(STRATA_SYCL_PROFILING_QUEUES)
+  add_compile_definitions(STRATA_SYCL_PROFILING_QUEUES=1)
+endif()
 set(_sycl_flags -fsycl)
 if(STRATA_SYCL_AOT)
   list(APPEND _sycl_flags -fsycl-targets=spir64_gen)

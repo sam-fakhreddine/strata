@@ -334,3 +334,27 @@ edit("src/program/generate.cpp", sub(
 edit("src/kernels/cuda/native_router.dp.cpp", lambda s: s.replace(
     "    item_ct1.barrier(sycl::access::fence_space::local_space);",
     "    sycl::group_barrier(item_ct1.get_sub_group());  // only subgroup row zero participates"))
+
+# 2026-10-09: dpct put `#define DPCT_PROFILING_ENABLED` at the top of every migrated file, so dpct::device_ext creates
+# every queue with sycl::property::queue::enable_profiling (include/dpct/device.hpp, create_queue_impl) and
+# dpct::sync_barrier records an event as a real barrier (`ext_oneapi_submit_barrier`) instead of an empty single_task.
+# On Level Zero a profiling queue needs a timestamp event per command and can keep the adapter off its cheaper in-order
+# event path; with 2,000+ launches per decode window that may be a visible share of the token. Nobody has measured it,
+# so the define is gated on the CMake option STRATA_SYCL_PROFILING_QUEUES (default ON, same binary as before) and two
+# builds can be compared. With it OFF, sycl::event::get_profiling_info throws (errc::invalid: the queue has no
+# enable_profiling property), so every timing site reads its timestamps through strata::prof_ns<>() (0 when profiling
+# is off, one "(profiling off)" note on stderr); the stage profiler and STRATA_*_TIMING then report zeros.
+def profiling_guard(s):
+    return re.sub(r"(?<!#ifdef STRATA_SYCL_PROFILING_QUEUES\n)^#define DPCT_PROFILING_ENABLED[ \t]*$",
+                  "#ifdef STRATA_SYCL_PROFILING_QUEUES\n#define DPCT_PROFILING_ENABLED\n#endif", s, flags=re.M)
+def profiling_reads(s):
+    t = re.sub(r"((?:\w+(?:\.|->))*\w+(?:\[[^\[\]]*\])*)\s*->\s*get_profiling_info<\s*sycl::info::event_profiling::\s*"
+               r"(command_end|command_start)\s*>\(\)", r"strata::prof_ns<sycl::info::event_profiling::\2>(\1)", s)
+    if t != s and '#include "strata/sycl_queue.hpp"' not in t:
+        t = t.replace("#include <dpct/dpct.hpp>\n", '#include <dpct/dpct.hpp>\n#include "strata/sycl_queue.hpp"\n', 1)
+    return t
+for d in ("src", "include/strata"):
+    for p in sorted(x for ext in ("*.cpp", "*.hpp") for x in (root / d).rglob(ext)):
+        edit(str(p.relative_to(root)), profiling_guard)
+for rel in all_sources():
+    edit(str(rel), profiling_reads)

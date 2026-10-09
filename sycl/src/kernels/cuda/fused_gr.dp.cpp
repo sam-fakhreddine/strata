@@ -1,5 +1,7 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <mutex>
 #include <unordered_map>
 #include <sycl/sycl.hpp>

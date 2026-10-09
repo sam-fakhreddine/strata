@@ -21,7 +21,9 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure
 // and the logit dump.
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -1553,12 +1555,8 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
         for (int b = 0; b < kBursts && ok; ++b) ok =
             DPCT_CHECK_ERROR(
                 ms[b] =
-                    (ev[b + 1]
-                         ->get_profiling_info<
-                             sycl::info::event_profiling::command_end>() -
-                     ev[b]
-                         ->get_profiling_info<
-                             sycl::info::event_profiling::command_start>()) /
+                    (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[b + 1]) -
+                     strata::prof_ns<sycl::info::event_profiling::command_start>(ev[b])) /
                     1000000.0f) == 0;
     }
     for (int i = 0; i < n_ev; ++i) dpct::destroy_event(ev[i]);

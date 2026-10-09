@@ -1,5 +1,7 @@
 // src/kernels/cuda/kv_q8.cu - see include/strata/kernels/kv_q8.hpp.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"

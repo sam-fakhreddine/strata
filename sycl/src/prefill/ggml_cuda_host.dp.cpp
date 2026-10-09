@@ -2,7 +2,9 @@
 // and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
 #include "common.cuh"
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include <cstdio>

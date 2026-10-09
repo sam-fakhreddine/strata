@@ -8,7 +8,9 @@
 // path's shapes: the hyper-connection down / up projections, the router and indexer rows, the PLE value matrix, a T
 // large enough to slice the activations, beta = 1 accumulation (the bf16x2 low parts) and an output row stride wider
 // than N.  --bench adds the time of each against the cuBLAS BF16 product.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/prefill/gemm.hpp"

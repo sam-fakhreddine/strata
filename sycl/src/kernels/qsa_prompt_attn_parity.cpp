@@ -9,9 +9,12 @@
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -320,16 +323,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     dpct::sync_barrier(e1);
     ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
     ms_old =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
+        (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+         strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
         1000000.0f;
     dpct::sync_barrier(e0);
     for (int r = 0; r < reps; ++r) new_run();
     dpct::sync_barrier(e1);
     ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
     ms_new =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
+        (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+         strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
         1000000.0f;
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
     const bool ok2 = diff <= 1e-4 * scale;

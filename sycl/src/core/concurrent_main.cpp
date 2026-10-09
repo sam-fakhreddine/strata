@@ -13,7 +13,9 @@
 // The CPU side is a READ LOOP over the same pinned arena rather than the real VNNI kernel, and that is
 // deliberate: the question is whether the two paths contend for DRAM BANDWIDTH, and a read loop is a pure
 // measurement of that demand, with no compute that could mask it.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/core/pinned.hpp"

@@ -1,5 +1,7 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -463,26 +465,14 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
     ms_ffn = 0; ms_post = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0;
-        a = (ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        a = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 4 + 1)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 4 + 0)])) /
             1000000.0f;
-        b = (ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        b = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 4 + 2)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 4 + 1)])) /
             1000000.0f;
-        c = (ev[(size_t)(l * 4 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        c = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 4 + 3)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 4 + 2)])) /
             1000000.0f;
         mixer_per_layer[(size_t) l] = (double) a;
         ms_ffn += b; ms_post += c;
@@ -550,8 +540,8 @@ bool session_replay_stage_sweep(const ModelGeometry &g, int64_t pos,
         return false;
     }
     float v = 0;
-    v = (b->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         a->get_profiling_info<sycl::info::event_profiling::command_start>()) /
+    v = (strata::prof_ns<sycl::info::event_profiling::command_end>(b) -
+         strata::prof_ns<sycl::info::event_profiling::command_start>(a)) /
         1000000.0f;
     dpct::destroy_event(a);
     dpct::destroy_event(b);
@@ -658,40 +648,20 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0, d = 0, e = 0;
-        a = (ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        a = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 6 + 1)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 6 + 0)])) /
             1000000.0f;
-        b = (ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        b = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 6 + 2)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 6 + 1)])) /
             1000000.0f;
-        c = (ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        c = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 6 + 3)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 6 + 2)])) /
             1000000.0f;
-        d = (ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        d = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 6 + 4)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 6 + 3)])) /
             1000000.0f;
-        e = (ev[(size_t)(l * 6 + 5)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
+        e = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[(size_t)(l * 6 + 5)]) -
+             strata::prof_ns<sycl::info::event_profiling::command_start>(ev[(size_t)(l * 6 + 4)])) /
             1000000.0f;
         t1 += a; t2 += b; t3 += c; t4 += d; t5 += e;
         mixer_per_layer[(size_t) l] = (double) c;   // prefix 3 IS the mixer: stages 0..2

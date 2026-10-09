@@ -6,7 +6,9 @@
 //   2. the INT8 gather is BITWISE equal to the host dequantization of those codes;
 //   3. against the FP16 path, the INT8 values differ by at most half a quantization step of their group plus the
 //      fp16 rounding of both sides (0.624 steps).
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/f16_bits.hpp"

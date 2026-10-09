@@ -31,7 +31,9 @@
 // writes its token to cap + j - so draft j's window is [cap + j - h, cap + j), exactly the row the target will use.
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/sampler.hpp"

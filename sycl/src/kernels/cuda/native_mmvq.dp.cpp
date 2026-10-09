@@ -23,7 +23,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_math.hpp"
@@ -2886,11 +2888,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
                     dpct::sync_barrier(e1, s);
                     e1->wait_and_throw();
                     float ms = 0;
-                        ms = (e1->get_profiling_info<
-                                  sycl::info::event_profiling::command_end>() -
-                              e0->get_profiling_info<
-                                  sycl::info::event_profiling::
-                                      command_start>()) /
+                        ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                              strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                              1000000.0f;
                     (cand ? tc : tb).push_back(ms * 1000.0f / 5);
                 }
@@ -2912,12 +2911,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
                         for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
                         dpct::sync_barrier(e1, s);
                         e1->wait_and_throw();
-                        float ms = 0; ms = (e1->get_profiling_info<
-                                                sycl::info::event_profiling::
-                                                    command_end>() -
-                                            e0->get_profiling_info<
-                                                sycl::info::event_profiling::
-                                                    command_start>()) /
+                        float ms = 0; ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(e1) -
+                                            strata::prof_ns<sycl::info::event_profiling::command_start>(e0)) /
                                            1000000.0f;
                         tc.push_back(ms * 1000.0f / 5);
                     }

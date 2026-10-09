@@ -1,6 +1,8 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -1126,12 +1128,8 @@ void stage_timing_report(int64_t n_layers) try {
         for (int64_t l = 0; l < n_layers && l < 64; ++l) {
             float ms = 0.0f;
             if (DPCT_CHECK_ERROR(
-                    ms = (g_st.b[l][s]
-                              ->get_profiling_info<
-                                  sycl::info::event_profiling::command_end>() -
-                          g_st.a[l][s]
-                              ->get_profiling_info<sycl::info::event_profiling::
-                                                       command_start>()) /
+                    ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(g_st.b[l][s]) -
+                          strata::prof_ns<sycl::info::event_profiling::command_start>(g_st.a[l][s])) /
                          1000000.0f) == 0) tot[s] += (double)ms;
         }
     }
@@ -1154,12 +1152,8 @@ void stage_timing_report(int64_t n_layers) try {
     for (int64_t l = 0; l < n_layers && l < 64; ++l) {
         float ms = 0.0f;
         if (DPCT_CHECK_ERROR(
-                ms = (g_st.b[l][1]
-                          ->get_profiling_info<
-                              sycl::info::event_profiling::command_end>() -
-                      g_st.a[l][1]
-                          ->get_profiling_info<
-                              sycl::info::event_profiling::command_start>()) /
+                ms = (strata::prof_ns<sycl::info::event_profiling::command_end>(g_st.b[l][1]) -
+                      strata::prof_ns<sycl::info::event_profiling::command_start>(g_st.a[l][1])) /
                      1000000.0f) != 0) continue;
         const bool is_qsa = (l % 4) == 3;
         if (is_qsa) { qsa += ms; ++nq; } else { gdn += ms; ++ng; }

@@ -116,6 +116,14 @@ Options:
   which takes about 47 s.
 - `-DSTRATA_SYCL_PARITY=OFF` skips the kernel tests (on by default). Run them with
   `ctest --test-dir build-sycl` on the card.
+- `-DSTRATA_SYCL_PROFILING_QUEUES=OFF` (default ON) builds without `enable_profiling` on the SYCL queues. The
+  migrated code defines dpct's `DPCT_PROFILING_ENABLED` in every file, so by default every queue carries the
+  profiling property and each event record is a real barrier; on Level Zero that means a timestamp event per
+  command, which can keep the adapter off its cheaper in-order event path. With 2,000 to 2,600 kernel launches per
+  decode window this may be a visible share of the round. Nobody has measured it on this card: it is an A/B
+  candidate, so build one binary each way and compare tokens per second. With it OFF the stage profiler
+  (`--stage-timing`), `STRATA_DECODE_TIMING` and `STRATA_PREFILL_TIMING` report zeros and print one
+  "(profiling off)" note; the parity tests still pass, their `--bench` times read 0.
 
 `setup_intel.py` looks for `build-sycl-aot/strata` or `build-sycl/strata` in the checkout. With the
 top-level option the engine is at `build-sycl/sycl/strata`, so either use `-S sycl` or set `STRATA_SYCL_BIN`.

@@ -9,7 +9,9 @@
 // stays NaN (the comparisons are false for it), so STRATA_DBG_NAN still sees one.
 #pragma once
 
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 

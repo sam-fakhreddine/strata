@@ -1,5 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#ifdef STRATA_SYCL_PROFILING_QUEUES
 #define DPCT_PROFILING_ENABLED
+#endif
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -1982,12 +1984,8 @@ struct PfTimer {
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
             if (DPCT_CHECK_ERROR(
-                    t = (ev[i + 1]
-                             ->get_profiling_info<
-                                 sycl::info::event_profiling::command_end>() -
-                         ev[i]
-                             ->get_profiling_info<sycl::info::event_profiling::
-                                                      command_start>()) /
+                    t = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[i + 1]) -
+                         strata::prof_ns<sycl::info::event_profiling::command_start>(ev[i])) /
                         1000000.0f) == 0) ms[ph[i]] += t;
         }
         std::swap(ev[0], ev[used - 1]);
@@ -2030,12 +2028,8 @@ struct PeTimer {
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
             if (DPCT_CHECK_ERROR(
-                    t = (ev[i + 1]
-                             ->get_profiling_info<
-                                 sycl::info::event_profiling::command_end>() -
-                         ev[i]
-                             ->get_profiling_info<sycl::info::event_profiling::
-                                                      command_start>()) /
+                    t = (strata::prof_ns<sycl::info::event_profiling::command_end>(ev[i + 1]) -
+                         strata::prof_ns<sycl::info::event_profiling::command_start>(ev[i])) /
                         1000000.0f) == 0) ms[ph[i]] += t;
         }
         std::swap(ev[0], ev[used - 1]);
