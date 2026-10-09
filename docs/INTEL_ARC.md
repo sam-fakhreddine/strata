@@ -155,6 +155,25 @@ Things that matter on an Arc (details in INTEL.md):
   `STRATA_*`, `ONEAPI_*`, `UR_*`, `IGC_*`, `SYCL_*` or `ZES_*` variable of the server's environment reach the engine
   through `strata-sycl.sh` (for example `STRATA_MIRROR_MIB`, `IGC_EnableDPEmulation`).
 
+## Running natively (no Docker)
+
+On a host with oneAPI installed (an Ubuntu VM with the `xe` driver, say), the served engine can run without the
+container. Three files in `sycl/serve/` and `sycl/tools/` are for that:
+
+- `sycl/serve/strata-native.sh`: an `exe` for `serve/server.py` and `sycl/serve/server_intel.py` that sources
+  `/opt/intel/oneapi/setvars.sh` (`INTEL_ONEAPI_ROOT` overrides), exports `SYCL_CACHE_PERSISTENT=0`, `ZES_ENABLE_SYSMAN=1`
+  and `ONEAPI_DEVICE_SELECTOR=level_zero:gpu` (a caller's value wins), applies the port's defaults
+  (`STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1`, `STRATA_STAGER_THREADS=8`; a `0` or empty value in the
+  config's `"env"` unsets one) and runs `build-sycl-aot/strata` or `build-sycl/strata` (`STRATA_SYCL_BIN` overrides)
+  with the serve pipes attached. The config's args are host paths; the engine's stderr goes to the config's `"log"`.
+- `sycl/serve/strata-flash.json.example`: a serve config for Flash-Next IQ2_XS on a 32 GB card with that `exe`,
+  files under `/opt/llm/strata`. Prompt borrowing is the engine's default (`--no-prefill-borrow` turns it off), so no flag.
+- `sycl/serve/strata-flash.service.example`: a systemd unit for a VM that shares the card with other model servers
+  (`Conflicts=` on every unit that can own it, an `ExecStartPre` that refuses to start unless the power cap reads 180 W,
+  the API key from a 0600 `EnvironmentFile`, `--host 127.0.0.1 --port 8097`).
+- `sycl/tools/strata_timings.py`: posts a JSON prompt suite to `/v1/chat/completions` and prints each response's
+  `timings` (`prompt_per_second`, `predicted_per_second`, ...) and a median row. Standard library only.
+
 ## Windows
 
 There is no Windows path yet. `setup --backend sycl` on Windows stops and points here. oneAPI exists for Windows,
