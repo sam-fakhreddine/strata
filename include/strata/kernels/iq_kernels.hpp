@@ -76,5 +76,10 @@ void native_expert_set_mode(int mode, int phase);
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
+/// SYCL port: the opt-in decode-once lane paths of the grouped expert kernels, type 17 (IQ2_XS, STRATA_IQ2XS_MULTI=1
+/// at startup) and type 29 (IQ1_M, STRATA_IQ1M_MULTI=1); bitwise the per-entry path.  Other types are ignored.  Set
+/// before graph capture.  Defined by the port only (sycl/); nothing in the CUDA build calls them.
+void iq_set_multi_opt_in(int type, bool on);
+bool iq_multi_opt_in(int type);
 
 }  // namespace strata::kernels

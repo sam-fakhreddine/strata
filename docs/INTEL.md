@@ -545,6 +545,9 @@ part of the procedure now: it caught a dropped mirror hook and four doorbell wai
 - **Lanes per row of the port's expert kernels** (`STRATA_GU_LANES` / `STRATA_DOWN_LANES`, 4/8/16/32 at run time):
   gate/up 8 or 16 x down 4 or 8 all decode in 37.7-38.6 ms per verify round (2 runs each, Coder, both prompts); tok/s
   differences between them are draft acceptance (each split rounds differently). The default (8 / 8) stays.
+- **Decode-once lane path for IQ2_XS and IQ1_M** (`STRATA_IQ2XS_MULTI=1`, `STRATA_IQ1M_MULTI=1`; off by default, 2026-10-09):
+  `Multi<17>` / `Multi<29>` let the lane kernels decode each 32-weight part once and apply it to 4 then 2 entries, as the
+  IQ2_S / IQ3_S / IQ3_XXS paths do; bitwise the per-entry dot (`iq_multi_parity`, the opt-in check). Unmeasured on the B70.
 - **Speed after the merge:** Coder 78.2 / 75.7 tok/s (as before), IQ2_XS 58.6 / 64.2 (from 50.8 / 60.6).
 - **Still failing:** (`iq_multi_parity` on IQ2_XS: fixed later, see "Two model-specific bugs"), `s2_expert_grouped_parity` (the s2 path), `kv_hybrid_parity`'s last step
   (needs the unported tensor-core prompt kernel). `ple_parity` and `native_expert_parity` need model files.

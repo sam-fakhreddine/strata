@@ -1584,6 +1584,21 @@ struct MultiW { int w[8]; int a = 0, b = 0; float d = 0.f; };
 
 template <int TY> struct Multi { static constexpr bool has = false; static constexpr int NW = 0; };
 
+// SYCL port: formats whose Multi path is opt-in at run time (STRATA_IQ2XS_MULTI=1 for IQ2_XS, STRATA_IQ1M_MULTI=1 for
+// IQ1_M; both unmeasured on the B70). The lane kernels (row_entries, native_down_kernel) take such a format's Multi
+// only when launched with OPT = true (launch_gu_lanes reads the switch); the default launch is byte-identical to before.
+template <int TY> inline constexpr bool kMultiOptIn = false;
+template <> inline constexpr bool kMultiOptIn<17> = true;
+template <> inline constexpr bool kMultiOptIn<29> = true;
+template <int TY, bool OPT> inline constexpr bool kUseMulti = Multi<TY>::has && (OPT || !kMultiOptIn<TY>);
+// A format whose finish needs the activation words too (IQ1_M: the per-8 delta times the activation sum) defines
+// finish_u(s0, s1, m, u, ds) instead of finish, and its own register words.
+template <int TY> inline constexpr bool kMultiNeedsU = false;
+template <> inline constexpr bool kMultiNeedsU<29> = true;
+struct MultiW1M { int w[8]; float delta[4]; int a = 0, b = 0; float d = 0.f; };
+template <int TY> struct MultiWOf { using type = MultiW; };
+template <> struct MultiWOf<29> { using type = MultiW1M; };
+
 template <> struct Multi<18> {   // iq3_xxs
     static constexpr bool has = true; static constexpr int NW = 8;
     __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
@@ -1655,6 +1670,52 @@ template <> struct Multi<22> {   // iq2_s
         ds = y[iqs / 2].ds[0];
     }
     __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        return m.d * ds * (float) ((s0 * m.a + s1 * m.b + (s0 + s1) / 2) / 4);
+    }
+};
+
+template <> struct Multi<17> {   // iq2_xs (opt-in: STRATA_IQ2XS_MULTI=1, kMultiOptIn)
+    // One part is 32 weights: the four 16-bit codes qs[2*iqs .. 2*iqs+3] (9-bit grid row, 7-bit sign index each), the
+    // two nibble scales of scales[iqs/2]. The same words, masks and integer expression as vec_dot_iq2_xs_q8_1, so each
+    // entry's result is bitwise the single-entry dot's (iq_multi_parity, the opt-in check).
+    static constexpr bool has = true; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW& m, const void* grid = nullptr) {
+        const block_iq2_xs* bq2 = (const block_iq2_xs*) vbq + kbx;
+#if STRATA_IQ4NL_FAST
+        // 8 bytes at (uint8_t*) qs + 4 * iqs: block_iq2_xs is 74 bytes (d, 32 codes, 8 scales) with qs 2 bytes in, so
+        // the address is 2-byte aligned and 4-byte aligned for odd kbx only; load8_a2 takes both (the extra word it reads
+        // when unaligned holds needed bytes, so it stays on the page), the IQ2_S prep's reasoning (82-byte blocks).
+        const sycl::int2 q2_packed = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);
+        const uint32_t q2_lo = (uint32_t) q2_packed.x(), q2_hi = (uint32_t) q2_packed.y();
+#else
+        const uint32_t q2_lo = (uint32_t) get_int_b2(bq2->qs, iqs + 0), q2_hi = (uint32_t) get_int_b2(bq2->qs, iqs + 1);
+#endif
+        // the codes by shifts out of the two words, never through a uint16_t* to an int2 (INTEL.md, 2026-10-01: the
+        // device compiler does not honour that punning)
+        const uint16_t q2[4] = {(uint16_t) q2_lo, (uint16_t) (q2_lo >> 16), (uint16_t) q2_hi, (uint16_t) (q2_hi >> 16)};
+        const sycl::uint2* G;
+        if (grid) G = (const sycl::uint2*) grid;
+        else G = (const sycl::uint2 *) iq2xs_grid;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const sycl::uint2 grid_pos = G[q2[l0 / 2] & 0x1FF];
+            const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+            const int signs0 = swar_ne4(signs & 0x08040201);
+            const int signs1 = swar_ne4(signs & 0x80402010);
+            m.w[l0 + 0] = swar_sub4(grid_pos.x() ^ signs0, signs0);
+            m.w[l0 + 1] = swar_sub4(grid_pos.y() ^ signs1, signs1);
+        }
+        m.a = bq2->scales[iqs / 2] & 0x0F;
+        m.b = bq2->scales[iqs / 2] >> 4;
+        m.d = sycl::vec<sycl::half, 1>(bq2->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
+        ds = y[iqs / 2].ds[0];
+    }
+    __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) {
+        // vec_dot_iq2_xs_q8_1: sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4; d = half(d) * ds; d * sumi
         return m.d * ds * (float) ((s0 * m.a + s1 * m.b + (s0 + s1) / 2) / 4);
     }
 };
@@ -1749,6 +1810,56 @@ template <> struct Multi<42> {   // q2_0 (down)
     __dpct_inline__ static float finish(int s0, int s1, const MultiW& m, float ds) { return m.d * ds * (float) (s0 + s1); }
 };
 
+template <> struct Multi<29> {   // iq1_m (opt-in: STRATA_IQ1M_MULTI=1, kMultiOptIn; MultiW1M, finish_u)
+    // One part (step 1) is 32 weights: qs[4*iqs .. 4*iqs+3] (grid row, low 8 bits), qh[2*iqs], qh[2*iqs+1] (two
+    // nibbles each: 3 high grid bits and the delta sign for 8 weights), the two 3-bit scales of this part and the fp16
+    // block scale spread over the top nibbles of the four scale words. Same words and expression as vec_dot_iq1_m_q8_1.
+    static constexpr bool has = true; static constexpr int NW = 8;
+    __dpct_inline__ static void prep(const void* vbq, int kbx, int iqs, MultiW1M& m, const void* grid = nullptr) {
+        const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
+        const int qs_packed = get_int_b4(bq1->qs, iqs);   // block_iq1_m has no fp16 head: qs is 4-byte aligned, as the dot reads it
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const uint32_t* G;
+        if (grid) G = (const uint32_t*) grid;
+        else G = iq1s_grid_gpu;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
+            const int gridv = G[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+            m.w[l0 + 0] = (gridv >> 0) & 0x0F0F0F0F;
+            m.w[l0 + 1] = (gridv >> 4) & 0x0F0F0F0F;
+            m.delta[l0 / 2] = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+        }
+        const uint16_t* sc = (const uint16_t*) bq1->scales;
+        iq1m_scale_t scale;
+        scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+        m.d = sycl::vec<sycl::half, 1>(scale.f16).convert<float, sycl::rounding_mode::automatic>()[0];
+        const int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+        m.a = 2 * ((tmp >> 0) & 0x07) + 1;
+        m.b = 2 * ((tmp >> 3) & 0x07) + 1;
+    }
+    __dpct_inline__ static void acts(const block_q8_1* y, int iqs, int* u, float& ds) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs].qs, j);
+        ds = y[iqs].ds[0];
+    }
+    __dpct_inline__ static float finish_u(int s0, int s1, const MultiW1M& m, const int* u, float ds) {
+        // vec_dot_iq1_m_q8_1: sumf[l0/4] += delta * sumy per pair of words, in l0 order; d = half(scale) * ds;
+        // d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1)
+        float sumf0 = 0.0f, sumf1 = 0.0f;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            int sumy = 0;
+            sumy = ggml_cuda_dp4a(u[l0 + 0], 0x01010101, sumy);
+            sumy = ggml_cuda_dp4a(u[l0 + 1], 0x01010101, sumy);
+            if (l0 < 4) sumf0 += m.delta[l0 / 2] * sumy;
+            else sumf1 += m.delta[l0 / 2] * sumy;
+        }
+        const float d = m.d * ds;
+        return d * ((s0 + sumf0) * m.a + (s1 + sumf1) * m.b);
+    }
+};
+
 // One row against E activations at once, LANES lanes per row.
 template <int TY, int LANES, int E>
 __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* xs, int nb, int sub, float* out,
@@ -1760,7 +1871,7 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* 
     for (int e = 0; e < E; ++e) s[e] = 0.f;
     for (int k = sub; k < nb * F::ipb; k += LANES) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        MultiW m;
+        typename MultiWOf<TY>::type m;
         M::prep(row, kbx, iqs, m, grid);
 #pragma unroll
         for (int e = 0; e < E; ++e) {
@@ -1772,7 +1883,8 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* 
             for (int j = 0; j < M::NW / 2; ++j) s0 = ggml_cuda_dp4a(m.w[j], u[j], s0);
 #pragma unroll
             for (int j = M::NW / 2; j < M::NW; ++j) s1 = ggml_cuda_dp4a(m.w[j], u[j], s1);
-            s[e] += M::finish(s0, s1, m, ds);
+            if constexpr (kMultiNeedsU<TY>) s[e] += M::finish_u(s0, s1, m, u, ds);
+            else s[e] += M::finish(s0, s1, m, ds);
         }
     }
 #pragma unroll
@@ -1780,12 +1892,13 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const* 
 }
 
 // The entries e0..e1 of one row: chunks of 4 through the multi-entry dot, the rest one at a time.
-template <int TY, int LANES>
+// OPT: take the opt-in Multi paths too (kMultiOptIn: IQ2_XS, IQ1_M); false is the default launch.
+template <int TY, int LANES, bool OPT = false>
 __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_stride, const int32_t* ent_idx,
                                  int e0, int e1, int nb, int sub, float* dst, size_t dst_stride,
                                  const void* grid = nullptr) {
     int e = e0;
-    if constexpr (Multi<TY>::has) {
+    if constexpr (kUseMulti<TY, OPT>) {
         for (; e + 4 <= e1; e += 4) {
             const block_q8_1* xs[4] = {x + (size_t) ent_idx[e] * x_stride, x + (size_t) ent_idx[e + 1] * x_stride,
                                        x + (size_t) ent_idx[e + 2] * x_stride, x + (size_t) ent_idx[e + 3] * x_stride};
@@ -1811,7 +1924,7 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
 
 constexpr int GU_ROWS = 8;     // rows per block (one warp each)
 
-template <int TG, int LN = kExpertLanes>
+template <int TG, int LN = kExpertLanes, bool OPT = false>
 __dpct_inline__ void native_gu_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1848,7 +1961,7 @@ __dpct_inline__ void native_gu_kernel(
     for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        row_entries<TG, LN>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
+        row_entries<TG, LN, OPT>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
     }
 }
 
@@ -1980,7 +2093,7 @@ __dpct_inline__ void swiglu_entries_kernel(const float *__restrict__ gate,
     h[i] = (g / (1.0f + sycl::native::exp(-g))) * up[i];
 }
 
-template <int TD, int LN = kExpertLanes>
+template <int TD, int LN = kExpertLanes, bool OPT = false>
 __dpct_inline__ void native_down_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1999,7 +2112,7 @@ __dpct_inline__ void native_down_kernel(
         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         int e = e0;
-        if constexpr (Multi<TD>::has) {
+        if constexpr (kUseMulti<TD, OPT>) {
             for (; e + 4 <= e1; e += 4) {
                 const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
                 float o[4];
@@ -2819,6 +2932,11 @@ bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 // dots with aligned loads and the IQ4 codebook in registers) are the measured ones, so they stay the default for
 // every format; STRATA_EXPERT_SPLIT=1 takes upstream's multi kernels, launched with their own grid (GU_ROWS rows).
 bool g_split_multi = env_on("STRATA_EXPERT_SPLIT");
+// SYCL port: the opt-in decode-once lane paths (Multi<17>, Multi<29>; kMultiOptIn). Read once at startup, as the
+// switches above; iq_set_multi_opt_in flips them (the parity test). Both unmeasured on the B70 (INTEL.md).
+bool g_iq2xs_multi = env_on("STRATA_IQ2XS_MULTI");
+bool g_iq1m_multi = env_on("STRATA_IQ1M_MULTI");
+template <int TY> bool multi_opt_on() { return TY == 17 ? g_iq2xs_multi : TY == 29 ? g_iq1m_multi : false; }
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
@@ -4105,29 +4223,43 @@ inline int lanes_env(const char* name) {
 }
 inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return v; }
 inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return v; }
-template <int TG, int LN>
+template <int TG, int LN, bool OPT = false>
 void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
                     const NativeExpertLayout &L, float *gate, float *up) {
     constexpr int ROWS = 256 / LN;
     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
     auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
-    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
+    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>,
+                                     dpct_kernel_scalar<OPT>>>(
         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-            native_gu_kernel<TG, LN>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            native_gu_kernel<TG, LN, OPT>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
         });
+}
+template <int TG, bool OPT = false>
+void launch_gu_lanes_opt(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                         const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                         const NativeExpertLayout &L, float *gate, float *up) {
+    switch (gu_lanes()) {
+        case 4: launch_gu_port<TG, 4, OPT>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 16: launch_gu_port<TG, 16, OPT>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 32: launch_gu_port<TG, 32, OPT>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        default: launch_gu_port<TG, 8, OPT>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+    }
 }
 template <int TG>
 void launch_gu_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                      const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
                      const NativeExpertLayout &L, float *gate, float *up) {
-    switch (gu_lanes()) {
-        case 4: launch_gu_port<TG, 4>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 16: launch_gu_port<TG, 16>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 32: launch_gu_port<TG, 32>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: launch_gu_port<TG, 8>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+    // the opt-in Multi paths (STRATA_IQ2XS_MULTI / STRATA_IQ1M_MULTI): only their formats instantiate the OPT kernels
+    if constexpr (kMultiOptIn<TG>) {
+        if (multi_opt_on<TG>()) {
+            launch_gu_lanes_opt<TG, true>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            return;
+        }
     }
+    launch_gu_lanes_opt<TG, false>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
 }
 template <int TD, int LN>
 void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
@@ -4224,6 +4356,11 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+void iq_set_multi_opt_in(int type, bool on) {
+    if (type == 17) g_iq2xs_multi = on;
+    else if (type == 29) g_iq1m_multi = on;
+}
+bool iq_multi_opt_in(int type) { return type == 17 ? g_iq2xs_multi : type == 29 ? g_iq1m_multi : false; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }

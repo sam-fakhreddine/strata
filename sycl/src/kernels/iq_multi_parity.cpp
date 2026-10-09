@@ -11,6 +11,9 @@
 // (2) native_expert_grouped, every gate/up format with the down formats: groups of 0..11 entries (more than a pass
 //     of GRP_NC), unused grid rows (cap_groups > groups), scattered destinations; bitwise, new vs old, the rows it
 //     must not write included.
+// (3) the opt-in decode-once lane paths (STRATA_IQ2XS_MULTI=1: IQ2_XS, STRATA_IQ1M_MULTI=1: IQ1_M), forced on with
+//     iq_set_multi_opt_in: groups of 1, 2, 4, 6, 8 entries, each group its own random blocks; bitwise against the
+//     per-entry lane path (the switch off) and the old kernels.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
@@ -428,6 +431,39 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s,
     }
 }
 
+// ----------------------------------------------------------------------------- (3) the opt-in Multi lane paths
+// STRATA_IQ2XS_MULTI=1 (IQ2_XS, Multi<17>) and STRATA_IQ1M_MULTI=1 (IQ1_M, Multi<29>) send a group's entries through
+// row_dot_multi in the lane kernels, 4 then 2 at a time; off, those formats take the per-entry dot.  Forced on here
+// with k::iq_set_multi_opt_in.  Groups of 1, 2, 4, 6 and 8 entries: the per-entry path alone, one E=2 pass, one E=4
+// pass, E=4 then E=2, two E=4 passes (plus 0, 3, 5, 7 for the mixed remainders), each group its own random blocks.
+// The opt-in output must be BITWISE the per-entry lane path's and the old kernels', the unwritten rows included.
+void check_opt_multi(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s, std::mt19937& rng) {
+    const std::vector<int> counts = {1, 2, 4, 6, 8, 8, 6, 4, 2, 1, 0, 3, 5, 7};
+    Grouped G(gu, dt, H, FF, counts, 8, rng);
+    k::iq_set_multi_opt_in(gu, false);
+    const auto a = G.result(false, s);   // the per-entry lane path (today's default)
+    const auto o = G.result(true, s);    // the old kernels
+    k::iq_set_multi_opt_in(gu, true);
+    const auto b = G.result(false, s);   // the opt-in decode-once path
+    k::iq_set_multi_opt_in(gu, false);
+    size_t diff = 0, diff_old = 0;
+    bool finite = true;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff += std::memcmp(&a[i], &b[i], 4) != 0;
+        diff_old += std::memcmp(&o[i], &b[i], 4) != 0;
+        if (i < (size_t) G.n_ent * H) finite = finite && std::isfinite(b[i]);
+    }
+    const bool ok = diff == 0 && diff_old == 0 && finite;
+    std::printf("%-8s/%-7s %5lld x %4lld  opt-in Multi (STRATA_%s_MULTI=1), groups of 1/2/4/6/8 entries (%d entries): %s\n",
+                name_of(gu), name_of(dt), (long long) H, (long long) FF, gu == 17 ? "IQ2XS" : "IQ1M", G.n_ent,
+                ok ? "bitwise equal to the per-entry path" : "FAIL");
+    if (!ok) {
+        std::printf("  %zu of %zu floats differ from the per-entry lane path, %zu from the old kernels%s\n", diff, a.size(),
+                    diff_old, finite ? "" : ", non-finite outputs");
+        ++g_fail;
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ --bench
 float time_ms(dpct::queue_ptr s, int it, const auto &fn) {
     dpct::event_ptr e0, e1;
@@ -502,6 +538,21 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
             for (int old = 1; old >= 0; --old)
                 us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
             std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+        }
+        std::printf("\n");
+    }
+    // the opt-in decode-once lane paths against the per-entry lane path, same shape: off / on
+    for (int gu : {17, 29}) {
+        std::printf("%-8s/Q2_0 grouped, 16 groups of m entries, STRATA_%s_MULTI off/on:", name_of(gu), gu == 17 ? "IQ2XS" : "IQ1M");
+        for (int m : {1, 2, 4, 8}) {
+            Grouped G(gu, 42, 2560, 640, std::vector<int>(16, m), 8, rng);
+            float us[2];
+            for (int on = 0; on < 2; ++on) {
+                k::iq_set_multi_opt_in(gu, on != 0);
+                us[on] = 1e3f * time_ms(s, 50, [&] { G.run(false, s); });
+            }
+            k::iq_set_multi_opt_in(gu, false);
+            std::printf("  m=%d: %.1f/%.1f", m, us[0], us[1]);
         }
         std::printf("\n");
     }
@@ -625,6 +676,10 @@ int main(int argc, char** argv) {
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42}) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
+    }
+    for (int gu : {17, 29}) {   // the opt-in decode-once lane paths, forced on
+        for (int dt : {20, 42}) check_opt_multi(gu, dt, 2560, 640, s, rng);
+        check_opt_multi(gu, 23, 1024, 512, s, rng);
     }
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
