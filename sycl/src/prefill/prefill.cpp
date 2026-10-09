@@ -4151,7 +4151,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 const auto& f = lay.fmt[(size_t) l];
                                 // 0.1.43: both matrices in one launch (the same values; STRATA_PF_DQ_FUSED=0: two launches)
                                 static const bool dq_one = [] { const char* v = std::getenv("STRATA_PF_DQ_FUSED"); return !(v && v[0] == '0'); }();
-                                if (dq_one) {
+                                // STRATA_DEQUANT_WG > 1 (this fork): the two-launch form, which has the work-group variants
+                                if (dq_one && strata::kernels::iq_dequant_wg() <= 1) {
                                     strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, blob_dev, blob_dev + f.up_off,
                                                                            blob_dev + f.down_off, f.n_ff, f.n_embd, m.dq_gu[q],
                                                                            m.dq_d[q], m.cs);
