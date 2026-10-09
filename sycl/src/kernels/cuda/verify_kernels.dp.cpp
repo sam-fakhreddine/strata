@@ -2077,7 +2077,11 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      const unsigned long long *slot_off, long long blob,
                      int32_t *__restrict__ pl, long long capx, uint32_t *skip,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
-                     volatile uint32_t *plan_err) {
+                     volatile uint32_t *plan_err, uint32_t *__restrict__ stats) {
+    // STRATA_MIRROR_STATS: `stats` is this layer's four counters (resident_plan_set_stats) or null: routed entries
+    // served from a VRAM slot, from the host mirror, from neither, and the groups the plan formed
+    using stat_ref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>;
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     int32_t[kResidentPlanMax]>(
@@ -2105,6 +2109,7 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         if (slot < 0 && maddr == 0)
             dpct::atomic_fetch_or<sycl::access::address_space::generic_space>(
                 &s_bad, 1);
+        if (stats != nullptr) stat_ref(stats[slot >= 0 ? 0 : maddr != 0 ? 1 : 2]).fetch_add(1u);
     }
     item_ct1.barrier(sycl::access::fence_space::local_space);
     if (s_bad) {
@@ -2205,6 +2210,7 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         counts[0] = groups;
         counts[1] = n;
         counts[2] = 0;
+        if (stats != nullptr) stat_ref(stats[3]).fetch_add((uint32_t) groups);
         if (skip != nullptr) {
             /*
             DPCT1078: Consider replacing memory_order::acq_rel with
@@ -2353,10 +2359,21 @@ __dpct_inline__ void copy_or_zero_kernel(sycl::float4 *__restrict__ dst,
 namespace {
 const int32_t* g_mirror_res = nullptr;
 const unsigned long long* g_mirror_table = nullptr;
+// STRATA_MIRROR_STATS: the [n_layers][4] counter buffer and the residency table its layers are found from
+const int32_t* g_stats_res = nullptr;
+uint32_t* g_stats = nullptr;
+long long g_stats_layers = 0;
+long long g_stats_expert = 0;
 }
 void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table) {
     g_mirror_res = d_res;
     g_mirror_table = mirror_table;
+}
+void resident_plan_set_stats(const int32_t* d_res, uint32_t* stats, long long n_layers, long long n_expert) {
+    g_stats_res = d_res;
+    g_stats = stats;
+    g_stats_layers = n_layers;
+    g_stats_expert = n_expert;
 }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
@@ -2364,6 +2381,11 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
         mir = g_mirror_table + (res_layer - g_mirror_res);
+    uint32_t* stats = nullptr;   // STRATA_MIRROR_STATS: this layer's four counters (a fixed address, so baked at capture)
+    if (g_stats != nullptr && g_stats_res != nullptr && g_stats_expert > 0 && res_layer >= g_stats_res) {
+        const long long layer = (long long) (res_layer - g_stats_res) / g_stats_expert;
+        if (layer < g_stats_layers) stats = g_stats + layer * 4;
+    }
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -2377,7 +2399,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                     [[sycl::reqd_sub_group_size(32)]] {
                         resident_plan_kernel(
                             ids, n_entries, k, res_layer, n_expert, cache_base,
-                            slot_off, blob, plan, capx, skip, ring, mir, plan_err);
+                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, stats);
                     });
     }
     check("resident_plan");

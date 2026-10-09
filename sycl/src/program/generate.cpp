@@ -4741,6 +4741,71 @@ int main(int argc, char **argv) try {
             return 2;
         }
     }
+    // STRATA_MIRROR_STATS=1: the device-built verify plan (resident_plan) counts per layer, in a device buffer of
+    // [n_layers][4] uint32, the routed entries it served from a VRAM slot, from the pinned host mirror (read over
+    // PCIe) and from neither (the error case), plus the groups it formed. The host-side counters (multi_misses,
+    // cache_hits, pcie_experts) belong to the CPU pool path the device plan bypasses, so they say nothing about the
+    // mirror. Read back and zeroed after each request, one summary line per request; =2 adds every layer. Off: no
+    // buffer, no kernel code.
+    const int mirror_stats = [] { const char* v = std::getenv("STRATA_MIRROR_STATS"); return v ? std::atoi(v) : 0; }();
+    uint32_t* mirror_stats_d = nullptr;   // [n_layers][4]: VRAM, mirror, neither, groups (lives as long as the process)
+    const size_t mirror_stats_n = (size_t) g.n_layers * 4;
+    if (mirror_stats > 0) {
+        mirror_stats_d = sycl::malloc_device<uint32_t>(mirror_stats_n, dpct::get_in_order_queue());
+        if (mirror_stats_d == nullptr) {
+            std::fprintf(stderr, "strata generate: the STRATA_MIRROR_STATS counter allocation failed\n");
+            return 1;
+        }
+        dpct::get_in_order_queue().memset(mirror_stats_d, 0, mirror_stats_n * sizeof(uint32_t)).wait();
+    }
+    // the counters since the last call, read back on `q` (the verifier's in-order compute queue, so after every
+    // window graph queued on it) and zeroed; `windows` is the request's verify windows (0: totals only). Returns the
+    // summary line's body and, with STRATA_MIRROR_STATS=2, every layer as L<l> <VRAM>/<mirror>/<neither>/<groups per
+    // window> in `per_layer`.
+    auto mirror_stats_report = [&](sycl::queue* q, int64_t windows, std::string& per_layer) -> std::string {
+        per_layer.clear();
+        std::vector<uint32_t> h(mirror_stats_n, 0u);
+        q->memcpy(h.data(), mirror_stats_d, mirror_stats_n * sizeof(uint32_t)).wait();
+        q->memset(mirror_stats_d, 0, mirror_stats_n * sizeof(uint32_t)).wait();
+        unsigned long long vram = 0, mirror = 0, neither = 0, groups = 0;
+        int64_t layers_seen = 0;
+        std::vector<int> order;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const uint32_t* c = h.data() + (size_t) l * 4;
+            vram += c[0]; mirror += c[1]; neither += c[2]; groups += c[3];
+            if (c[0] + c[1] + c[2] > 0) { ++layers_seen; order.push_back((int) l); }
+        }
+        auto share = [&](int l) {   // the layer's mirror share of its routed entries
+            const uint32_t* c = h.data() + (size_t) l * 4;
+            const double tot = (double) c[0] + (double) c[1] + (double) c[2];
+            return tot > 0 ? (double) c[1] / tot : 0.0;
+        };
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return share(a) > share(b); });
+        char buf[512];
+        int off = std::snprintf(buf, sizeof buf, "VRAM %llu, mirror %llu, neither %llu routed entries over %lld windows",
+                                vram, mirror, neither, (long long) windows);
+        if (!order.empty()) {
+            off += std::snprintf(buf + off, sizeof buf - (size_t) off, "; worst layers by mirror share:");
+            for (size_t i = 0; i < order.size() && i < 3; ++i) {
+                const uint32_t* c = h.data() + (size_t) order[i] * 4;
+                off += std::snprintf(buf + off, sizeof buf - (size_t) off, " L%d %.1f%% (%u/%u)", order[i],
+                                     100.0 * share(order[i]), c[1], c[0] + c[1] + c[2]);
+            }
+        }
+        const double per_win = windows > 0 && layers_seen > 0 ? (double) groups / ((double) windows * (double) layers_seen) : 0.0;
+        std::snprintf(buf + off, sizeof buf - (size_t) off, "; %.2f groups per window per layer (%lld layers planned)",
+                      per_win, (long long) layers_seen);
+        if (mirror_stats >= 2) {
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                const uint32_t* c = h.data() + (size_t) l * 4;
+                char lb[96];
+                std::snprintf(lb, sizeof lb, "%sL%lld %u/%u/%u/%.1f", l > 0 ? " " : "", (long long) l, c[0], c[1], c[2],
+                              windows > 0 ? (double) c[3] / (double) windows : (double) c[3]);
+                per_layer += lb;
+            }
+        }
+        return std::string(buf);
+    };
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
@@ -6848,6 +6913,8 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        if (mirror_stats_d != nullptr && thits.d_res != nullptr)   // STRATA_MIRROR_STATS: before the windows are captured
+            strata::kernels::resident_plan_set_stats(thits.d_res, mirror_stats_d, (long long) g.n_layers, (long long) g.n_expert);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -11422,6 +11489,14 @@ int main(int argc, char **argv) try {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            // STRATA_MIRROR_STATS: what the device-built plan served from VRAM, the mirror or neither this request
+            // (read on the verifier's compute queue, so after this request's window graphs; the counters restart)
+            if (mirror_stats_d != nullptr) {
+                std::string per_layer;
+                const std::string body = mirror_stats_report(ver.stream(), dec_windows, per_layer);
+                std::fprintf(stderr, "strata serve: mirror stats: %s\n", body.c_str());
+                if (!per_layer.empty()) std::fprintf(stderr, "strata serve: mirror stats per layer: %s\n", per_layer.c_str());
+            }
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
@@ -11947,6 +12022,8 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        if (mirror_stats_d != nullptr && thits.d_res != nullptr)   // STRATA_MIRROR_STATS: before the windows are captured
+            strata::kernels::resident_plan_set_stats(thits.d_res, mirror_stats_d, (long long) g.n_layers, (long long) g.n_expert);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -12420,6 +12497,12 @@ int main(int argc, char **argv) try {
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
                         drive.d.pcie_num);
+        if (mirror_stats_d != nullptr) {   // STRATA_MIRROR_STATS: the device-built plan's VRAM / mirror / neither counts
+            std::string per_layer;
+            const std::string body = mirror_stats_report(ver.stream(), rounds, per_layer);
+            std::printf("%-24s %s\n", "mirror stats", body.c_str());
+            if (!per_layer.empty()) std::printf("%-24s %s\n", "mirror stats per layer", per_layer.c_str());
+        }
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
